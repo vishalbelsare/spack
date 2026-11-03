@@ -1,5 +1,4 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -10,7 +9,7 @@ import os
 def cpus_available():
     """
     Returns the number of CPUs available for the current process, or the number
-    of phyiscal CPUs when that information cannot be retrieved. The number
+    of physical CPUs when that information cannot be retrieved. The number
     of available CPUs might differ from the number of physical CPUs when
     using spack through Slurm or container runtimes.
     """

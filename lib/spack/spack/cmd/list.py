@@ -1,9 +1,6 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-
-from __future__ import division, print_function
 
 import argparse
 import fnmatch
@@ -12,21 +9,20 @@ import math
 import os
 import re
 import sys
+from html import escape
+from typing import Optional, Type
 
-import llnl.util.tty as tty
-from llnl.util.tty.colify import colify
-
-import spack.dependency
+import spack.deptypes as dt
+import spack.package_base
 import spack.repo
+from spack.cmd.common import arguments
+from spack.util import tty
+from spack.util.tty.colify import colify
+from spack.util.url import path_to_file_url
 from spack.version import VersionList
 
-if sys.version_info > (3, 1):
-    from html import escape  # novm
-else:
-    from cgi import escape
-
 description = "list and search available packages"
-section = "basic"
+section = "query"
 level = "short"
 
 
@@ -39,22 +35,59 @@ def formatter(func):
     return func
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
-        'filter', nargs=argparse.REMAINDER,
-        help='optional case-insensitive glob patterns to filter results')
+        "filter",
+        nargs=argparse.REMAINDER,
+        help="optional case-insensitive glob patterns to filter results",
+    )
     subparser.add_argument(
-        '-d', '--search-description', action='store_true', default=False,
-        help='filtering will also search the description for a match')
+        "-r",
+        "--repo",
+        "-N",
+        "--namespace",
+        dest="repos",
+        action="append",
+        default=[],
+        help="only list packages from the specified repo/namespace",
+    )
     subparser.add_argument(
-        '--format', default='name_only', choices=formatters,
-        help='format to be used to print the output [default: name_only]')
+        "-d",
+        "--search-description",
+        action="store_true",
+        default=False,
+        help="filtering will also search the description for a match",
+    )
     subparser.add_argument(
-        '--update', metavar='FILE', default=None, action='store',
-        help='write output to the specified file, if any package is newer')
+        "--format",
+        default="name_only",
+        choices=formatters,
+        help="format to be used to print the output [default: name_only]",
+    )
     subparser.add_argument(
-        '-v', '--virtuals', action='store_true', default=False,
-        help='include virtual packages in list')
+        "-v",
+        "--virtuals",
+        action="store_true",
+        default=False,
+        help="include virtual packages in list",
+    )
+    arguments.add_common_arguments(subparser, ["tags"])
+
+    # Doesn't really make sense to update in count mode.
+    count_or_update = subparser.add_mutually_exclusive_group()
+    count_or_update.add_argument(
+        "--count",
+        action="store_true",
+        default=False,
+        help="display the number of packages that would be listed",
+    )
+    count_or_update.add_argument(
+        "--update",
+        metavar="FILE",
+        default=None,
+        action="store",
+        help="write output to the specified file, if any package is newer",
+    )
 
 
 def filter_by_name(pkgs, args):
@@ -71,8 +104,8 @@ def filter_by_name(pkgs, args):
     if args.filter:
         res = []
         for f in args.filter:
-            if '*' not in f and '?' not in f:
-                r = fnmatch.translate('*' + f + '*')
+            if "*" not in f and "?" not in f:
+                r = fnmatch.translate("*" + f + "*")
             else:
                 r = fnmatch.translate(f)
 
@@ -80,17 +113,21 @@ def filter_by_name(pkgs, args):
             res.append(rc)
 
         if args.search_description:
+
             def match(p, f):
                 if f.match(p):
                     return True
 
-                pkg = spack.repo.get(p)
-                if pkg.__doc__:
-                    return f.match(pkg.__doc__)
+                pkg_cls = spack.repo.PATH.get_pkg_class(p)
+                if pkg_cls.__doc__:
+                    return f.match(pkg_cls.__doc__)
                 return False
+
         else:
+
             def match(p, f):
                 return f.match(p)
+
         pkgs = [p for p in pkgs if any(match(p, f) for f in res)]
 
     return sorted(pkgs, key=lambda s: s.lower())
@@ -99,15 +136,45 @@ def filter_by_name(pkgs, args):
 @formatter
 def name_only(pkgs, out):
     indent = 0
-    if out.isatty():
-        tty.msg("%d packages." % len(pkgs))
     colify(pkgs, indent=indent, output=out)
+    if out.isatty():
+        tty.msg("%d packages" % len(pkgs))
 
 
-def github_url(pkg):
-    """Link to a package file on github."""
-    url = 'https://github.com/spack/spack/blob/develop/var/spack/repos/builtin/packages/{0}/package.py'
-    return url.format(pkg.name)
+def _is_spack_packages(url: str) -> bool:
+    """True if ``url`` is likely the official github.com/spack/spack-packages repo."""
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url.endswith(("github.com/spack/spack-packages", "github.com:spack/spack-packages"))
+
+
+def github_url(pkg: Type[spack.package_base.PackageBase]) -> Optional[str]:
+    """Link to a package file in spack package's github or the path to the file.
+
+    Args:
+        pkg: package instance
+
+    Returns: URL to the package file on github or the local file path; otherwise, ``None``.
+    """
+    module_path = f"{pkg.__module__.replace('.', '/')}.py"
+    for repo in spack.repo.PATH.repos:
+        if not repo.python_path:
+            continue
+
+        path = os.path.join(repo.python_path, module_path)
+        if not os.path.exists(path):
+            continue
+
+        if repo.remote_info is not None and _is_spack_packages(repo.remote_info.url):
+            rel = os.path.relpath(path, repo.remote_info.root).replace(os.sep, "/")
+            return f"https://github.com/spack/spack-packages/blob/develop/{rel}"
+
+        tty.debug(f"Package repository of {pkg} has no github git url, using path URL")
+        return path_to_file_url(path)
+
+    tty.debug(f"Unable to determine the package repository URL for {pkg}")
+    return None
 
 
 def rows_for_ncols(elts, ncols):
@@ -123,8 +190,8 @@ def rows_for_ncols(elts, ncols):
 
 def get_dependencies(pkg):
     all_deps = {}
-    for deptype in spack.dependency.all_deptypes:
-        deps = pkg.dependencies_of_type(deptype)
+    for deptype in dt.ALL_TYPES:
+        deps = pkg.dependencies_of_type(dt.flag_from_string(deptype))
         all_deps[deptype] = [d for d in deps]
 
     return all_deps
@@ -133,32 +200,35 @@ def get_dependencies(pkg):
 @formatter
 def version_json(pkg_names, out):
     """Print all packages with their latest versions."""
-    pkgs = [spack.repo.get(name) for name in pkg_names]
+    pkg_classes = [spack.repo.PATH.get_pkg_class(name) for name in pkg_names]
 
-    out.write('[\n')
+    out.write("[\n")
 
     # output name and latest version for each package
-    pkg_latest = ",\n".join([
-        '  {{"name": "{0}",\n'
-        '   "latest_version": "{1}",\n'
-        '   "versions": {2},\n'
-        '   "homepage": "{3}",\n'
-        '   "file": "{4}",\n'
-        '   "maintainers": {5},\n'
-        '   "dependencies": {6}'
-        '}}'.format(
-            pkg.name,
-            VersionList(pkg.versions).preferred(),
-            json.dumps([str(v) for v in reversed(sorted(pkg.versions))]),
-            pkg.homepage,
-            github_url(pkg),
-            json.dumps(pkg.maintainers),
-            json.dumps(get_dependencies(pkg))
-        ) for pkg in pkgs
-    ])
+    pkg_latest = ",\n".join(
+        [
+            '  {{"name": "{0}",\n'
+            '   "latest_version": "{1}",\n'
+            '   "versions": {2},\n'
+            '   "homepage": "{3}",\n'
+            '   "file": "{4}",\n'
+            '   "maintainers": {5},\n'
+            '   "dependencies": {6}'
+            "}}".format(
+                pkg_cls.name,
+                VersionList(pkg_cls.versions).preferred(),
+                json.dumps([str(v) for v in reversed(sorted(pkg_cls.versions))]),
+                pkg_cls.homepage,
+                github_url(pkg_cls),
+                json.dumps(pkg_cls.maintainers),
+                json.dumps(get_dependencies(pkg_cls)),
+            )
+            for pkg_cls in pkg_classes
+        ]
+    )
     out.write(pkg_latest)
     # important: no trailing comma in JSON arrays
-    out.write('\n]\n')
+    out.write("\n]\n")
 
 
 @formatter
@@ -172,7 +242,7 @@ def html(pkg_names, out):
     """
 
     # Read in all packages
-    pkgs = [spack.repo.get(name) for name in pkg_names]
+    pkg_classes = [spack.repo.PATH.get_pkg_class(name) for name in pkg_names]
 
     # Start at 2 because the title of the page from Sphinx is id1.
     span_id = 2
@@ -181,88 +251,98 @@ def html(pkg_names, out):
     def head(n, span_id, title, anchor=None):
         if anchor is None:
             anchor = title
-        out.write(('<span id="id%d"></span>'
-                   '<h1>%s<a class="headerlink" href="#%s" '
-                   'title="Permalink to this headline">&para;</a>'
-                   '</h1>\n') % (span_id, title, anchor))
+        out.write(
+            (
+                '<span id="id%d"></span>'
+                '<h1>%s<a class="headerlink" href="#%s" '
+                'title="Permalink to this headline">&para;</a>'
+                "</h1>\n"
+            )
+            % (span_id, title, anchor)
+        )
 
     # Start with the number of packages, skipping the title and intro
     # blurb, which we maintain in the RST file.
-    out.write('<p>\n')
-    out.write('Spack currently has %d mainline packages:\n' % len(pkgs))
-    out.write('</p>\n')
+    out.write("<p>\n")
+    out.write("Spack currently has %d mainline packages:\n" % len(pkg_classes))
+    out.write("</p>\n")
 
     # Table of links to all packages
     out.write('<table border="1" class="docutils">\n')
     out.write('<tbody valign="top">\n')
     for i, row in enumerate(rows_for_ncols(pkg_names, 3)):
-        out.write('<tr class="row-odd">\n' if i % 2 == 0 else
-                  '<tr class="row-even">\n')
+        out.write('<tr class="row-odd">\n' if i % 2 == 0 else '<tr class="row-even">\n')
         for name in row:
-            out.write('<td>\n')
-            out.write('<a class="reference internal" href="#%s">%s</a></td>\n'
-                      % (name, name))
-            out.write('</td>\n')
-        out.write('</tr>\n')
-    out.write('</tbody>\n')
-    out.write('</table>\n')
+            out.write("<td>\n")
+            out.write('<a class="reference internal" href="#%s">%s</a></td>\n' % (name, name))
+            out.write("</td>\n")
+        out.write("</tr>\n")
+    out.write("</tbody>\n")
+    out.write("</table>\n")
     out.write('<hr class="docutils"/>\n')
 
     # Output some text for each package.
-    for pkg in pkgs:
-        out.write('<div class="section" id="%s">\n' % pkg.name)
-        head(2, span_id, pkg.name)
+    for pkg_cls in pkg_classes:
+        out.write('<div class="section" id="%s">\n' % pkg_cls.name)
+        head(2, span_id, pkg_cls.name)
         span_id += 1
 
         out.write('<dl class="docutils">\n')
 
-        out.write('<dt>Homepage:</dt>\n')
+        out.write("<dt>Homepage:</dt>\n")
         out.write('<dd><ul class="first last simple">\n')
 
-        if pkg.homepage:
-            out.write(('<li>'
-                       '<a class="reference external" href="%s">%s</a>'
-                       '</li>\n') % (pkg.homepage, escape(pkg.homepage, True)))
+        if pkg_cls.homepage:
+            out.write(
+                ('<li><a class="reference external" href="%s">%s</a></li>\n')
+                % (pkg_cls.homepage, escape(pkg_cls.homepage, True))
+            )
         else:
-            out.write('No homepage\n')
-        out.write('</ul></dd>\n')
+            out.write("No homepage\n")
+        out.write("</ul></dd>\n")
 
-        out.write('<dt>Spack package:</dt>\n')
+        out.write("<dt>Spack package:</dt>\n")
         out.write('<dd><ul class="first last simple">\n')
-        out.write(('<li>'
-                   '<a class="reference external" href="%s">%s/package.py</a>'
-                   '</li>\n') % (github_url(pkg), pkg.name))
-        out.write('</ul></dd>\n')
+        out.write(
+            ('<li><a class="reference external" href="%s">%s/package.py</a></li>\n')
+            % (github_url(pkg_cls), pkg_cls.name)
+        )
+        out.write("</ul></dd>\n")
 
-        if pkg.versions:
-            out.write('<dt>Versions:</dt>\n')
-            out.write('<dd>\n')
-            out.write(', '.join(
-                str(v) for v in reversed(sorted(pkg.versions))))
-            out.write('\n')
-            out.write('</dd>\n')
+        if pkg_cls.versions:
+            out.write("<dt>Versions:</dt>\n")
+            out.write("<dd>\n")
+            out.write(", ".join(str(v) for v in reversed(sorted(pkg_cls.versions))))
+            out.write("\n")
+            out.write("</dd>\n")
 
-        for deptype in spack.dependency.all_deptypes:
-            deps = pkg.dependencies_of_type(deptype)
+        for deptype in dt.ALL_TYPES:
+            deps = pkg_cls.dependencies_of_type(dt.flag_from_string(deptype))
             if deps:
-                out.write('<dt>%s Dependencies:</dt>\n' % deptype.capitalize())
-                out.write('<dd>\n')
-                out.write(', '.join(
-                    d if d not in pkg_names else
-                    '<a class="reference internal" href="#%s">%s</a>' % (d, d)
-                    for d in deps))
-                out.write('\n')
-                out.write('</dd>\n')
+                out.write("<dt>%s Dependencies:</dt>\n" % deptype.capitalize())
+                out.write("<dd>\n")
+                out.write(
+                    ", ".join(
+                        (
+                            d
+                            if d not in pkg_names
+                            else '<a class="reference internal" href="#%s">%s</a>' % (d, d)
+                        )
+                        for d in deps
+                    )
+                )
+                out.write("\n")
+                out.write("</dd>\n")
 
-        out.write('<dt>Description:</dt>\n')
-        out.write('<dd>\n')
-        out.write(escape(pkg.format_doc(indent=2), True))
-        out.write('\n')
-        out.write('</dd>\n')
-        out.write('</dl>\n')
+        out.write("<dt>Description:</dt>\n")
+        out.write("<dd>\n")
+        out.write(escape(pkg_cls.format_doc(indent=2), True))
+        out.write("\n")
+        out.write("</dd>\n")
+        out.write("</dl>\n")
 
         out.write('<hr class="docutils"/>\n')
-        out.write('</div>\n')
+        out.write("</div>\n")
 
 
 def list(parser, args):
@@ -270,21 +350,34 @@ def list(parser, args):
     formatter = formatters[args.format]
 
     # Retrieve the names of all the packages
-    pkgs = set(spack.repo.all_package_names(args.virtuals))
+    repos = [spack.repo.PATH]
+    if args.repos:
+        repos = [spack.repo.PATH.get_repo(name) for name in args.repos]
+
+    pkgs = {name for repo in repos for name in repo.all_package_names(args.virtuals)}
+
     # Filter the set appropriately
     sorted_packages = filter_by_name(pkgs, args)
+
+    # If tags have been specified on the command line, filter by tags
+    if args.tags:
+        packages_with_tags = spack.repo.PATH.packages_with_tags(*args.tags)
+        sorted_packages = [p for p in sorted_packages if p in packages_with_tags]
 
     if args.update:
         # change output stream if user asked for update
         if os.path.exists(args.update):
-            if os.path.getmtime(args.update) > spack.repo.path.last_mtime():
-                tty.msg('File is up to date: %s' % args.update)
+            if os.path.getmtime(args.update) > spack.repo.PATH.last_mtime():
+                tty.msg("File is up to date: %s" % args.update)
                 return
 
-        tty.msg('Updating file: %s' % args.update)
-        with open(args.update, 'w') as f:
+        tty.msg("Updating file: %s" % args.update)
+        with open(args.update, "w", encoding="utf-8") as f:
             formatter(sorted_packages, f)
 
+    elif args.count:
+        # just print the number of packages in the result
+        print(len(sorted_packages))
     else:
-        # Print to stdout
+        # print formatted package list
         formatter(sorted_packages, sys.stdout)

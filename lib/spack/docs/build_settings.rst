@@ -1,319 +1,334 @@
-.. Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-   Spack Project Developers. See the top-level COPYRIGHT file for details.
+..
+   Copyright Spack Project Developers. See COPYRIGHT file for details.
 
    SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-.. _build-settings:
+.. meta::
+   :description lang=en:
+      Understand how to control the build process in Spack by customizing package-specific build settings and environment variables.
 
-===================
-Build Customization
-===================
+.. index::
+   single: concretizer; configuring
+   single: microarchitecture; target granularity
 
-Spack allows you to customize how your software is built through the
-``packages.yaml`` file.  Using it, you can make Spack prefer particular
-implementations of virtual dependencies (e.g., MPI or BLAS/LAPACK),
-or you can make it prefer to build with particular compilers.  You can
-also tell Spack to use *external* software installations already
-present on your system.
+.. _concretizer-options:
 
-At a high level, the ``packages.yaml`` file is structured like this:
+Concretization Settings (concretizer.yaml)
+==========================================
 
-.. code-block:: yaml
+The ``concretizer.yaml`` configuration file allows users to customize aspects of the algorithm used to select the dependencies they install.
+The default configuration is the following:
 
-   packages:
-     package1:
-       # settings for package1
-     package2:
-       # settings for package2
-     # ...
-     all:
-       # settings that apply to all packages.
+.. literalinclude:: _spack_root/etc/spack/defaults/base/concretizer.yaml
+   :language: yaml
 
-So you can either set build preferences specifically for *one* package,
-or you can specify that certain settings should apply to *all* packages.
-The types of settings you can customize are described in detail below.
 
-Spack's build defaults are in the default
-``etc/spack/defaults/packages.yaml`` file.  You can override them in
-``~/.spack/packages.yaml`` or ``etc/spack/packages.yaml``. For more
-details on how this works, see :ref:`configuration-scopes`.
+Completion of external nodes
+----------------------------
 
-.. _sec-external-packages:
-
------------------
-External Packages
------------------
-
-Spack can be configured to use externally-installed
-packages rather than building its own packages. This may be desirable
-if machines ship with system packages, such as a customized MPI
-that should be used instead of Spack building its own MPI.
-
-External packages are configured through the ``packages.yaml`` file found
-in a Spack installation's ``etc/spack/`` or a user's ``~/.spack/``
-directory. Here's an example of an external configuration:
+:ref:`The external packages <sec-external-packages>` available from the ``packages.yaml`` configuration file are usually reporting only a few of the variants defined in the corresponding recipe.
+Users can configure how Spack deals with missing information for externals via the ``concretizer:externals:completion`` attribute:
 
 .. code-block:: yaml
 
-   packages:
-     openmpi:
-       externals:
-       - spec: "openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64"
-         prefix: /opt/openmpi-1.4.3
-       - spec: "openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64+debug"
-         prefix: /opt/openmpi-1.4.3-debug
-       - spec: "openmpi@1.6.5%intel@10.1 arch=linux-debian7-x86_64"
-         prefix: /opt/openmpi-1.6.5-intel
-
-This example lists three installations of OpenMPI, one built with GCC,
-one built with GCC and debug information, and another built with Intel.
-If Spack is asked to build a package that uses one of these MPIs as a
-dependency, it will use the pre-installed OpenMPI in
-the given directory. Note that the specified path is the top-level
-install prefix, not the ``bin`` subdirectory.
-
-``packages.yaml`` can also be used to specify modules to load instead
-of the installation prefixes.  The following example says that module
-``CMake/3.7.2`` provides cmake version 3.7.2.
-
-.. code-block:: yaml
-
-   cmake:
+   concretizer:
      externals:
-     - spec: cmake@3.7.2
-       modules:
-       - CMake/3.7.2
+       completion: default_variants
 
-Each ``packages.yaml`` begins with a ``packages:`` attribute, followed
-by a list of package names.  To specify externals, add an ``externals:``
-attribute under the package name, which lists externals.
-Each external should specify a ``spec:`` string that should be as
-well-defined as reasonably possible.  If a
-package lacks a spec component, such as missing a compiler or
-package version, then Spack will guess the missing component based
-on its most-favored packages, and it may guess incorrectly.
+This attribute currently allows two possible values:
 
-Each package version and compiler listed in an external should
-have entries in Spack's packages and compiler configuration, even
-though the package and compiler may not ever be built.
+- ``architecture_only``: only the mandatory architectural information is completed on externals
+- ``default_variants``: external specs are also completed with missing variants, using their default values
 
-The packages configuration can tell Spack to use an external location
-for certain package versions, but it does not restrict Spack to using
-external packages.  In the above example, since newer versions of OpenMPI
-are available, Spack will choose to start building and linking with the
-latest version rather than continue using the pre-installed OpenMPI versions.
 
-To prevent this, the ``packages.yaml`` configuration also allows packages
-to be flagged as non-buildable.  The previous example could be modified to
-be:
+.. index::
+   single: reuse; configuring
+   single: fresh; configuring
 
-.. code-block:: yaml
+Reuse Already Installed Packages
+--------------------------------
 
-   packages:
-     openmpi:
-       externals:
-       - spec: "openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64"
-         prefix: /opt/openmpi-1.4.3
-       - spec: "openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64+debug"
-         prefix: /opt/openmpi-1.4.3-debug
-       - spec: "openmpi@1.6.5%intel@10.1 arch=linux-debian7-x86_64"
-         prefix: /opt/openmpi-1.6.5-intel
-       buildable: False
+The ``reuse`` attribute controls how aggressively Spack reuses binary packages during concretization.
+The attribute can be either a single value or an object for more complex configurations.
 
-The addition of the ``buildable`` flag tells Spack that it should never build
-its own version of OpenMPI, and it will instead always rely on a pre-built
-OpenMPI.  Similar to ``paths``, ``buildable`` is specified as a property under
-a package name.
+In the former case ("single value"), it allows Spack to:
 
-If an external module is specified as not buildable, then Spack will load the
-external module into the build environment which can be used for linking.
+1. Reuse installed packages and build caches for all the specs to be concretized, when ``true``.
+2. Reuse installed packages and build caches only for the dependencies of the root specs, when ``dependencies``.
+3. Disregard reusing installed packages and build caches, when ``false``.
 
-The ``buildable`` does not need to be paired with external packages.
-It could also be used alone to forbid packages that may be
-buggy or otherwise undesirable.
+In case finer control over which specs are reused is needed, the value of this attribute can be an object with the following keys:
 
-Virtual packages in Spack can also be specified as not buildable, and
-external implementations can be provided. In the example above,
-OpenMPI is configured as not buildable, but Spack will often prefer
-other MPI implementations over the externally available OpenMPI. Spack
-can be configured with every MPI provider not buildable individually,
-but more conveniently:
+1. ``roots``: if ``true`` root specs are reused, if ``false`` only dependencies of root specs are reused
+2. ``from``: list of sources from which reused specs are taken
+
+Each source in ``from`` is itself an object with the following attributes:
+
+.. list-table:: Attributes for a source or reusable specs
+   :header-rows: 1
+
+   * - Attribute name
+     - Description
+   * - type (mandatory, string)
+     - Can be ``local``, ``buildcache``, or ``external``.
+   * - include (optional, list of specs)
+     - If present, reusable specs must match at least one of the constraints in the list.
+   * - exclude (optional, list of specs)
+     - If present, reusable specs must not match any of the constraints in the list.
+
+For instance, the following configuration:
 
 .. code-block:: yaml
 
-   packages:
-     mpi:
-       buildable: False
-     openmpi:
-       externals:
-       - spec: "openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64"
-         prefix: /opt/openmpi-1.4.3
-       - spec: "openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64+debug"
-         prefix: /opt/openmpi-1.4.3-debug
-       - spec: "openmpi@1.6.5%intel@10.1 arch=linux-debian7-x86_64"
-         prefix: /opt/openmpi-1.6.5-intel
+   concretizer:
+     reuse:
+       roots: true
+       from:
+       - type: local
+         include:
+         - "%gcc"
+         - "%clang"
 
-Implementations can also be listed immediately under the virtual they provide:
+tells the concretizer to reuse all specs compiled with either ``gcc`` or ``clang`` that are installed in the local store.
+Any spec from remote build caches is disregarded.
 
-.. code-block:: yaml
-
-   packages:
-     mpi:
-       buildable: False
-         openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64: /opt/openmpi-1.4.3
-         openmpi@1.4.3%gcc@4.4.7 arch=linux-debian7-x86_64+debug: /opt/openmpi-1.4.3-debug
-         openmpi@1.6.5%intel@10.1 arch=linux-debian7-x86_64: /opt/openmpi-1.6.5-intel
-         mpich@3.3 %clang@9.0.0 arch=linux-debian7-x86_64: /opt/mpich-3.3-intel
-
-Spack can then use any of the listed external implementations of MPI
-to satisfy a dependency, and will choose depending on the compiler and
-architecture.
-
-.. _cmd-spack-external-find:
-
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Automatically Find External Packages
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-You can run the :ref:`spack external find <spack-external-find>` command
-to search for system-provided packages and add them to ``packages.yaml``.
-After running this command your ``packages.yaml`` may include new entries:
+To reduce the boilerplate in configuration files, default values for the ``include`` and ``exclude`` options can be pushed up one level:
 
 .. code-block:: yaml
 
-   packages:
-     cmake:
-       externals:
-       - spec: cmake@3.17.2
-         prefix: /usr
+   concretizer:
+     reuse:
+       roots: true
+       include:
+       - "%gcc"
+       from:
+       - type: local
+       - type: buildcache
+       - type: local
+         include:
+         - "foo %oneapi"
 
-Generally this is useful for detecting a small set of commonly-used packages;
-for now this is generally limited to finding build-only dependencies.
-Specific limitations include:
+In the example above, we reuse all specs compiled with ``gcc`` from the local store and remote build caches, and we also reuse ``foo %oneapi``.
+Note that the last source of specs overrides the default ``include`` attribute.
 
-* Packages are not discoverable by default: For a package to be
-  discoverable with ``spack external find``, it needs to add special
-  logic. See :ref:`here <make-package-findable>` for more details.
-* The current implementation only collects and examines executable files,
-  so it is typically only useful for build/run dependencies (in some cases
-  if a library package also provides an executable, it may be possible to
-  extract a meaningful Spec by running the executable - for example the
-  compiler wrappers in MPI implementations).
-* The logic does not search through module files, it can only detect
-  packages with executables defined in ``PATH``; you can help Spack locate
-  externals which use module files by loading any associated modules for
-  packages that you want Spack to know about before running
-  ``spack external find``.
-* Spack does not overwrite existing entries in the package configuration:
-  If there is an external defined for a spec at any configuration scope,
-  then Spack will not add a new external entry (``spack config blame packages``
-  can help locate all external entries).
+For one-off concretizations, there are command-line arguments for each of the simple "single value" configurations.
+This means a user can:
 
-.. _concretization-preferences:
+.. code-block:: console
 
---------------------------
-Concretization Preferences
---------------------------
+   % spack install --reuse <spec>
 
-Spack can be configured to prefer certain compilers, package
-versions, dependencies, and variants during concretization.
-The preferred configuration can be controlled via the
-``~/.spack/packages.yaml`` file for user configurations, or the
-``etc/spack/packages.yaml`` site configuration.
+to enable reuse for a single installation, or:
 
-Here's an example ``packages.yaml`` file that sets preferred packages:
+.. code-block:: console
 
-.. code-block:: yaml
+   $ spack install --fresh <spec>
 
-   packages:
-     opencv:
-       compiler: [gcc@4.9]
-       variants: +debug
-     gperftools:
-       version: [2.2, 2.4, 2.3]
-     all:
-       compiler: [gcc@4.4.7, 'gcc@4.6:', intel, clang, pgi]
-       target: [sandybridge]
-       providers:
-         mpi: [mvapich2, mpich, openmpi]
+to do a fresh install if ``reuse`` is enabled by default.
 
-At a high level, this example is specifying how packages should be
-concretized.  The opencv package should prefer using GCC 4.9 and
-be built with debug options.  The gperftools package should prefer version
-2.2 over 2.4.  Every package on the system should prefer mvapich2 for
-its MPI and GCC 4.4.7 (except for opencv, which overrides this by preferring GCC 4.9).
-These options are used to fill in implicit defaults.  Any of them can be overwritten
-on the command line if explicitly requested.
+.. seealso::
 
-Each ``packages.yaml`` file begins with the string ``packages:`` and
-package names are specified on the next level. The special string ``all``
-applies settings to *all* packages. Underneath each package name is one
-or more components: ``compiler``, ``variants``, ``version``,
-``providers``, and ``target``.  Each component has an ordered list of
-spec ``constraints``, with earlier entries in the list being preferred
-over later entries.
+   FAQ: :ref:`Why does Spack pick particular versions and variants? <faq-concretizer-precedence>`
 
-Sometimes a package installation may have constraints that forbid
-the first concretization rule, in which case Spack will use the first
-legal concretization rule.  Going back to the example, if a user
-requests gperftools 2.3 or later, then Spack will install version 2.4
-as the 2.4 version of gperftools is preferred over 2.3.
+Selection of Target Microarchitectures
+------------------------------------------
 
-An explicit concretization rule in the preferred section will always
-take preference over unlisted concretizations.  In the above example,
-xlc isn't listed in the compiler list.  Every listed compiler from
-gcc to pgi will thus be preferred over the xlc compiler.
+The options under the ``targets`` attribute control which targets are considered during a solve.
+Currently, the options in this section are only configurable from the ``concretizer.yaml`` file, and there are no corresponding command-line arguments to enable them for a single solve.
 
-The syntax for the ``provider`` section differs slightly from other
-concretization rules.  A provider lists a value that packages may
-``depend_on`` (e.g, MPI) and a list of rules for fulfilling that
-dependency.
-
-.. _package_permissions:
-
--------------------
-Package Permissions
--------------------
-
-Spack can be configured to assign permissions to the files installed
-by a package.
-
-In the ``packages.yaml`` file under ``permissions``, the attributes
-``read``, ``write``, and ``group`` control the package
-permissions. These attributes can be set per-package, or for all
-packages under ``all``. If permissions are set under ``all`` and for a
-specific package, the package-specific settings take precedence.
-
-The ``read`` and ``write`` attributes take one of ``user``, ``group``,
-and ``world``.
+The ``granularity`` option can take two possible values: ``microarchitectures`` and ``generic``.
+If set to:
 
 .. code-block:: yaml
 
-  packages:
-    all:
-      permissions:
-        write: group
-        group: spack
-    my_app:
-      permissions:
-        read: group
-        group: my_team
+   concretizer:
+     targets:
+       granularity: microarchitectures
 
-The permissions settings describe the broadest level of access to
-installations of the specified packages. The execute permissions of
-the file are set to the same level as read permissions for those files
-that are executable. The default setting for ``read`` is ``world``,
-and for ``write`` is ``user``. In the example above, installations of
-``my_app`` will be installed with user and group permissions but no
-world permissions, and owned by the group ``my_team``. All other
-packages will be installed with user and group write privileges, and
-world read privileges. Those packages will be owned by the group
-``spack``.
+Spack will consider all the microarchitectures known to ``archspec`` to label nodes for compatibility.
+If instead the option is set to:
 
-The ``group`` attribute assigns a Unix-style group to a package. All
-files installed by the package will be owned by the assigned group,
-and the sticky group bit will be set on the install prefix and all
-directories inside the install prefix. This will ensure that even
-manually placed files within the install prefix are owned by the
-assigned group. If no group is assigned, Spack will allow the OS
-default behavior to go as expected.
+.. code-block:: yaml
+
+   concretizer:
+     targets:
+       granularity: generic
+
+Spack will consider only generic microarchitectures.
+For instance, when running on a Haswell machine, Spack will consider ``haswell`` as the best target in the former case and ``x86_64_v3`` as the best target in the latter case.
+
+The ``host_compatible`` option is a Boolean option that determines whether or not the microarchitectures considered during the solve are constrained to be compatible with the host Spack is currently running on.
+For instance, if this option is set to ``true``, a user cannot concretize for ``target=icelake`` while running on a Haswell machine.
+
+Duplicate Nodes
+---------------
+
+The ``duplicates`` attribute controls whether the DAG can contain multiple configurations of the same package.
+This is mainly relevant for build dependencies, which may have their version pinned by some nodes and thus be required at different versions by different nodes in the same DAG.
+
+The ``strategy`` option controls how the solver deals with duplicates.
+If the value is ``none``, then a single configuration per package is allowed in the DAG.
+This means, for instance, that only a single ``cmake`` or a single ``py-setuptools`` version is allowed.
+The result would be a slightly faster concretization at the expense of making a few specs unsolvable.
+
+If the value is ``minimal``, Spack will allow packages tagged as ``build-tools`` to have duplicates.
+This allows, for instance, to concretize specs whose nodes require different and incompatible ranges of some build tool.
+For instance, in the figure below, the latest `py-shapely` requires a newer `py-setuptools`, while `py-numpy` still needs an older version:
+
+.. figure:: images/shapely_duplicates.svg
+   :width: 5580
+   :height: 1842
+
+Up to Spack v0.20, ``duplicates:strategy:none`` was the default (and only) behavior.
+From Spack v0.21, the default behavior is ``duplicates:strategy:minimal``.
+
+.. index::
+   single: splicing; in config
+   :name: splicing
+
+Splicing
+--------
+
+The ``splice`` key covers configuration attributes for splicing specs in the solver.
+
+"Splicing" is a method for replacing a dependency with another spec that provides the same package or virtual.
+There are two types of splices, referring to different behaviors for shared dependencies between the root spec and the new spec replacing a dependency: "transitive" and "intransitive".
+A "transitive" splice is one that resolves all conflicts by taking the dependency from the new node.
+An "intransitive" splice is one that resolves all conflicts by taking the dependency from the original root.
+From a theory perspective, hybrid splices are possible but are not modeled by Spack.
+
+All spliced specs retain a ``build_spec`` attribute that points to the original spec before any splice occurred.
+The ``build_spec`` for a non-spliced spec is itself.
+
+The figure below shows examples of transitive and intransitive splices:
+
+.. figure:: images/splices.png
+   :width: 2308
+   :height: 1248
+
+The concretizer can be configured to explicitly splice particular replacements for a target spec.
+Splicing will allow the user to make use of generically built public binary caches while swapping in highly optimized local builds for performance-critical components and/or components that interact closely with the specific hardware details of the system.
+The most prominent candidate for splicing is MPI providers.
+MPI packages have relatively well-understood ABI characteristics, and most High Performance Computing facilities deploy highly optimized MPI packages tailored to their particular hardware.
+The following configuration block configures Spack to replace whatever MPI provider each spec was concretized to use with the particular package of ``mpich`` with the hash that begins ``abcdef``.
+
+.. code-block:: yaml
+
+   concretizer:
+     splice:
+       explicit:
+       - target: mpi
+         replacement: mpich/abcdef
+         transitive: false
+
+.. warning::
+
+   When configuring an explicit splice, you as the user take on the responsibility for ensuring ABI compatibility between the specs matched by the target and the replacement you provide.
+   If they are not compatible, Spack will not warn you, and your application will fail to run.
+
+The ``target`` field of an explicit splice can be any abstract spec.
+The ``replacement`` field must be a spec that includes the hash of a concrete spec, and the replacement must either be the same package as the target, provide the virtual that is the target, or provide a virtual that the target provides.
+The ``transitive`` field is optional -- by default, splices will be transitive.
+
+.. note::
+
+   With explicit splices configured, it is possible for Spack to concretize to a spec that does not satisfy the input.
+   For example, with the configuration above, ``hdf5 ^mvapich2`` will concretize to use ``mpich/abcdef`` instead of ``mvapich2`` as the MPI provider.
+   Spack will warn the user in this case, but will not fail the concretization.
+
+.. _automatic_splicing:
+
+Automatic Splicing
+^^^^^^^^^^^^^^^^^^
+
+The Spack solver can be configured to do automatic splicing for ABI-compatible packages.
+Automatic splices are enabled in the concretizer configuration section:
+
+.. code-block:: yaml
+
+   concretizer:
+     splice:
+       automatic: true
+
+Packages can include ABI-compatibility information using the ``can_splice`` directive.
+See :ref:`the packaging guide <abi_compatibility>` for instructions on specifying ABI compatibility using the ``can_splice`` directive.
+
+.. note::
+
+   The ``can_splice`` directive is experimental and may be changed in future versions.
+
+When automatic splicing is enabled, the concretizer will combine any number of ABI-compatible specs if possible to reuse installed packages and packages available from binary caches.
+The end result of these specs is equivalent to a series of transitive/intransitive splices, but the series may be non-obvious.
+
+.. index::
+   single: concretization cache
+
+.. _concretization-cache:
+
+Concretization Cache
+--------------------
+
+Spack can cache the results of successful concretization runs and reuse them for identical solves.
+The cache is configured under the ``concretizer:concretization_cache`` attribute in ``concretizer.yaml``.
+
+``concretizer:concretization_cache:enable``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When set to ``true``, Spack will utilize a cache of solver outputs from successful concretization runs.
+When enabled, Spack will check the concretization cache prior to running the solver.
+If a previous request to solve a given problem is present in the cache, Spack will load the concrete specs and other solver data from the cache rather than running the solver.
+Specs not previously concretized will be added to the cache on a successful solve.
+The cache additionally holds solver statistics, so commands like ``spack solve`` will still return information about the run that produced a given solver result.
+
+This cache is a subcache of the :ref:`Misc Cache` and as such will be cleaned when the Misc Cache is cleaned.
+
+When ``false`` or omitted, all concretization requests will be performed from scratch.
+
+``concretizer:concretization_cache:url``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Path to the location where Spack will root the concretization cache.
+Currently this only supports paths on the local filesystem.
+
+Default location is under the :ref:`Misc Cache` at: ``$misc_cache/concretization``
+
+The cache can be shared among users on the same machine.
+Spack creates cache directories and entries with permissions that follow your umask, so sharing is controlled entirely by how the cache directory is set up.
+There are two ways to share:
+
+* **Read-only sharing**: one user (e.g. a CI account) populates the cache with a typical umask (e.g. ``022``), and other users point ``concretizer:concretization_cache:url`` at it.
+  Spack degrades gracefully in a cache it cannot write to.
+  Hits are returned, and misses simply re-run the solver.
+
+* **Read/write sharing**: point ``concretizer:concretization_cache:url`` at a directory owned by a common group, group-writable, and with the setgid bit set:
+
+  .. code-block:: console
+
+     $ chgrp spackusers $cache_dir
+     $ chmod 2770 $cache_dir
+
+  If sharers may have restrictive umasks, you can also set a default ACL so that entries are always group read/write:
+
+  .. code-block:: console
+
+     $ setfacl -d -m u::rwx,g::rwx,o::--- $cache_dir
+
+  Avoid sticky, world-writable locations like ``/tmp``: the sticky bit prevents users from replacing or pruning each other's entries.
+
+``concretizer:concretization_cache:entry_limit``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Sets a limit on the number of concretization results that Spack will cache.
+The limit is evaluated after each concretization run; if Spack has stored more results than the limit allows, the oldest concretization results are pruned until 10% of the limit has been removed.
+
+Setting this value to 0 disables automatic pruning.
+It is expected that users will be responsible for maintaining this cache.
+
+``concretizer:concretization_cache:size_limit``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Sets a limit on the size of the concretization cache in bytes.
+The limit is evaluated after each concretization run; if Spack has stored more results than the limit allows, the oldest concretization results are pruned until 10% of the limit has been removed.
+
+Setting this value to 0 disables automatic pruning.
+It is expected that users will be responsible for maintaining this cache.

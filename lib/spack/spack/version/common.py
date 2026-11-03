@@ -1,0 +1,45 @@
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
+#
+# SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+import spack.error
+from spack.util.git import is_git_commit_sha
+
+# Infinity-like versions. The order in the list implies the comparison rules
+infinity_versions = ["stable", "nightly", "trunk", "head", "master", "main", "develop"]
+
+iv_min_len = min(len(s) for s in infinity_versions)
+
+ALPHA = 0
+BETA = 1
+RC = 2
+FINAL = 3
+
+PRERELEASE_TO_STRING = ["alpha", "beta", "rc"]
+STRING_TO_PRERELEASE = {"alpha": ALPHA, "beta": BETA, "rc": RC, "final": FINAL}
+
+
+def is_git_version(string: str) -> bool:
+    """``git.<ref>``, ``<sha>`` or ``<ref>=<version or range>``"""
+    if string.startswith("git."):
+        return True
+    ref, sep, _ = string.partition("=")
+    if not sep:
+        return is_git_commit_sha(ref)
+    return bool(ref) and ":" not in ref
+
+
+class VersionError(spack.error.SpackError):
+    """This is raised when something is wrong with a version."""
+
+
+class VersionChecksumError(VersionError):
+    """Raised for version checksum errors."""
+
+
+class VersionLookupError(VersionError):
+    """Raised for errors looking up git commits as versions."""
+
+
+class EmptyRangeError(VersionError):
+    """Raised when constructing an empty version range."""

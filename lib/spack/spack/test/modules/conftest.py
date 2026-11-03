@@ -1,64 +1,48 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+import pathlib
+
 import pytest
 
-import spack.config
+import spack.concretize
 import spack.modules.common
-import spack.paths
 import spack.spec
-import spack.util.path
 
 
 @pytest.fixture()
 def modulefile_content(request):
-    """Returns a function that generates the content of a module file
-    as a list of lines.
-    """
+    """Returns a function that generates the content of a module file as a list of lines."""
+    writer_cls = getattr(request.module, "writer_cls")
 
-    writer_cls = getattr(request.module, 'writer_cls')
-
-    def _impl(spec_str, module_set_name='default'):
-        # Write the module file
-        spec = spack.spec.Spec(spec_str)
-        spec.concretize()
-        generator = writer_cls(spec, module_set_name)
+    def _impl(spec_like, module_set_name="default", explicit=True):
+        if isinstance(spec_like, str):
+            spec_like = spack.spec.Spec(spec_like)
+        spec = spack.concretize.concretize_one(spec_like)
+        generator = writer_cls.from_spec(spec, module_set_name, explicit)
         generator.write(overwrite=True)
-
-        # Get its filename
-        filename = generator.layout.filename
-
-        # Retrieve the content
-        with open(filename) as f:
-            content = f.readlines()
-            content = ''.join(content).split('\n')
-        generator.remove()
+        written_module = pathlib.Path(generator.layout.filename)
+        content = written_module.read_text(encoding="utf-8").splitlines()
+        generator.remove_installation()
         return content
 
     return _impl
 
 
 @pytest.fixture()
-def update_template_dirs(config, monkeypatch):
-    """Mocks the template directories for tests"""
-    dirs = spack.config.get_config('config')['template_dirs']
-    dirs = [spack.util.path.canonicalize_path(x) for x in dirs]
-    monkeypatch.setattr(spack, 'template_dirs', dirs)
+def factory(request, mock_modules_root):
+    """Given a spec string, returns an instance of the writer and the corresponding spec."""
+    writer_cls = getattr(request.module, "writer_cls")
+
+    def _mock(spec_string, module_set_name="default", explicit=True):
+        spec = spack.concretize.concretize_one(spec_string)
+        return writer_cls.from_spec(spec, module_set_name, explicit), spec
+
+    return _mock
 
 
 @pytest.fixture()
-def factory(request):
-    """Function that, given a spec string, returns an instance of the writer
-    and the corresponding spec.
-    """
-
-    # Class of the module file writer
-    writer_cls = getattr(request.module, 'writer_cls')
-
-    def _mock(spec_string, module_set_name='default'):
-        spec = spack.spec.Spec(spec_string)
-        spec.concretize()
-        return writer_cls(spec, module_set_name), spec
-
-    return _mock
+def mock_module_filename(monkeypatch, tmp_path: pathlib.Path):
+    filename = tmp_path / "module"
+    monkeypatch.setattr(spack.modules.common.FileLayout, "filename", str(filename))
+    yield str(filename)

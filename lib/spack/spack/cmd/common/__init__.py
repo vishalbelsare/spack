@@ -1,12 +1,10 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import llnl.util.tty as tty
-import llnl.util.tty.color as color
-
 import spack.paths
+from spack.util import tty
+from spack.util.tty import color
 
 
 def shell_init_instructions(cmd, equivalent):
@@ -35,8 +33,15 @@ def shell_init_instructions(cmd, equivalent):
         color.colorize("@*c{For fish:}"),
         "  source %s/setup-env.fish" % spack.paths.share_path,
         "",
-        "Or, if you do not want to use shell support, run " + (
-            "one of these" if shell_specific else "this") + " instead:",
+        color.colorize("@*c{For Windows batch:}"),
+        "  %s\\spack_cmd.bat" % spack.paths.bin_path,
+        "",
+        color.colorize("@*c{For PowerShell:}"),
+        "  %s\\setup-env.ps1" % spack.paths.share_path,
+        "",
+        "Or, if you do not want to use shell support, run "
+        + ("one of these" if shell_specific else "this")
+        + " instead:",
         "",
     ]
 
@@ -45,6 +50,8 @@ def shell_init_instructions(cmd, equivalent):
             equivalent.format(sh_arg="--sh  ") + "  # bash/zsh/sh",
             equivalent.format(sh_arg="--csh ") + "  # csh/tcsh",
             equivalent.format(sh_arg="--fish") + "  # fish",
+            equivalent.format(sh_arg="--bat ") + "  # batch",
+            equivalent.format(sh_arg="--pwsh") + "  # powershell",
         ]
     else:
         msg += ["  " + equivalent]
@@ -56,5 +63,5 @@ def shell_init_instructions(cmd, equivalent):
         "without any path components (such as `bin/spack`).",
     ]
 
-    msg += ['']
+    msg += [""]
     tty.error(*msg)

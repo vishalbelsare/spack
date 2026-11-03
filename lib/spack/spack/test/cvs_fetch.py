@@ -1,34 +1,24 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import os
+import pathlib
 
 import pytest
 
-from llnl.util.filesystem import mkdirp, touch, working_dir
-
-import spack.config
-import spack.repo
+import spack.concretize
 from spack.fetch_strategy import CvsFetchStrategy
-from spack.spec import Spec
-from spack.stage import Stage
+from spack.stage import stage_from_config
 from spack.util.executable import which
-from spack.version import ver
+from spack.util.filesystem import mkdirp, touch, working_dir
+from spack.version import Version
 
-pytestmark = pytest.mark.skipif(
-    not which('cvs'),
-    reason='requires CVS to be installed')
+pytestmark = pytest.mark.skipif(not which("cvs"), reason="requires CVS to be installed")
 
 
-@pytest.mark.parametrize("type_of_test", ['default', 'branch', 'date'])
-def test_fetch(
-        type_of_test,
-        mock_cvs_repository,
-        config,
-        mutable_mock_repo
-):
+@pytest.mark.parametrize("type_of_test", ["default", "branch", "date"])
+def test_fetch(type_of_test, mock_cvs_repository, config, mutable_mock_repo):
     """Tries to:
 
     1. Fetch the repo using a fetch strategy constructed with
@@ -47,16 +37,14 @@ def test_fetch(
     get_date = mock_cvs_repository.get_date
 
     # Construct the package under test
-    spec = Spec('cvs-test')
-    spec.concretize()
-    pkg = spack.repo.get(spec)
-    pkg.versions[ver('cvs')] = test.args
+    spec = spack.concretize.concretize_one("cvs-test")
+    spec.package.versions[Version("cvs")] = test.args
 
     # Enter the stage directory and check some properties
-    with pkg.stage:
-        pkg.do_stage()
+    with spec.package.stage:
+        spec.package.do_stage()
 
-        with working_dir(pkg.stage.source_path):
+        with working_dir(spec.package.stage.source_path):
             # Check branch
             if test.branch is not None:
                 assert get_branch() == test.branch
@@ -65,32 +53,31 @@ def test_fetch(
             if test.date is not None:
                 assert get_date() <= test.date
 
-            file_path = os.path.join(pkg.stage.source_path, test.file)
-            assert os.path.isdir(pkg.stage.source_path)
+            file_path = os.path.join(spec.package.stage.source_path, test.file)
+            assert os.path.isdir(spec.package.stage.source_path)
             assert os.path.isfile(file_path)
 
             os.unlink(file_path)
             assert not os.path.isfile(file_path)
 
-            untracked_file = 'foobarbaz'
+            untracked_file = "foobarbaz"
             touch(untracked_file)
             assert os.path.isfile(untracked_file)
-            pkg.do_restage()
+            spec.package.do_restage()
             assert not os.path.isfile(untracked_file)
 
-            assert os.path.isdir(pkg.stage.source_path)
+            assert os.path.isdir(spec.package.stage.source_path)
             assert os.path.isfile(file_path)
 
 
-def test_cvs_extra_fetch(tmpdir):
+def test_cvs_extra_fetch(tmp_path: pathlib.Path, config):
     """Ensure a fetch after downloading is effectively a no-op."""
-    testpath = str(tmpdir)
+    testpath = str(tmp_path)
 
-    fetcher = CvsFetchStrategy(
-        cvs=':pserver:not-a-real-cvs-repo%module=not-a-real-module')
+    fetcher = CvsFetchStrategy(cvs=":pserver:not-a-real-cvs-repo%module=not-a-real-module")
     assert fetcher is not None
 
-    with Stage(fetcher, path=testpath) as stage:
+    with stage_from_config(fetcher, path=testpath, config=config) as stage:
         assert stage is not None
 
         source_path = stage.source_path

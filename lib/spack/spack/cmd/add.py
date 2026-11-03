@@ -1,33 +1,36 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import llnl.util.tty as tty
+import argparse
 
 import spack.cmd
-import spack.cmd.common.arguments as arguments
+from spack.cmd.common import arguments
+from spack.util import tty
 
-description = 'add a spec to an environment'
+description = "add a spec to an environment"
 section = "environments"
 level = "long"
 
 
-def setup_parser(subparser):
-    subparser.add_argument('-l', '--list-name',
-                           dest='list_name', default='specs',
-                           help="name of the list to add specs to")
-    arguments.add_common_arguments(subparser, ['specs'])
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "-l",
+        "--list-name",
+        dest="list_name",
+        default="specs",
+        help="name of the list to add specs to",
+    )
+    arguments.add_common_arguments(subparser, ["specs"])
 
 
 def add(parser, args):
-    env = spack.cmd.require_active_env(cmd_name='add')
+    env = spack.cmd.require_active_env(args.subparser)
 
     with env.write_transaction():
         for spec in spack.cmd.parse_specs(args.specs):
             if not env.add(spec, args.list_name):
-                tty.msg("Package {0} was already added to {1}"
-                        .format(spec.name, env.name))
+                tty.msg("Package {0} was already added to {1}".format(spec.name, env.name))
             else:
-                tty.msg('Adding %s to environment %s' % (spec, env.name))
+                tty.msg("Adding %s to environment %s" % (spec, env.name))
         env.write()

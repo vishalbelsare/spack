@@ -1,52 +1,63 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 
+import argparse
 import sys
 
-import llnl.util.tty as tty
-from llnl.util.tty.color import cprint, get_color_when
-
 import spack.cmd
-import spack.cmd.common.arguments as arguments
-import spack.environment as ev
-import spack.solver.asp as asp
-import spack.util.environment
+import spack.hash_lookup
+import spack.repo
 import spack.util.spack_json as sjson
+from spack.active_environment import active_environment
+from spack.cmd.common import arguments
+from spack.solver import asp, clauses
+from spack.util import tty
+from spack.util.tty.color import cprint, get_color_when
 
 description = "compare two specs"
-section = "basic"
+section = "query"
 level = "long"
 
 
-def setup_parser(subparser):
-    arguments.add_common_arguments(
-        subparser, ['specs'])
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
+    arguments.add_common_arguments(subparser, ["specs"])
 
     subparser.add_argument(
-        '--json',
-        action='store_true',
+        "--json",
+        action="store_true",
         default=False,
-        dest='dump_json',
-        help="Dump json output instead of pretty printing."
+        dest="dump_json",
+        help="dump json output instead of pretty printing",
     )
     subparser.add_argument(
-        '--first',
-        action='store_true',
+        "--first",
+        action="store_true",
         default=False,
-        dest='load_first',
-        help="load the first match if multiple packages match the spec"
+        dest="load_first",
+        help="load the first match if multiple packages match the spec",
     )
     subparser.add_argument(
-        '-a', '--attribute',
-        action='append',
-        help="select the attributes to show (defaults to all)"
+        "-a",
+        "--attribute",
+        action="append",
+        help="select the attributes to show (defaults to all)",
+    )
+    subparser.add_argument(
+        "--ignore", action="append", help="omit diffs related to these dependencies"
     )
 
 
-def compare_specs(a, b, to_string=False, color=None):
+def shift(asp_function: asp.AspFunction) -> asp.AspFunction:
+    """Transforms ``attr("foo", "bar")`` into ``foo("bar")``."""
+    args = asp_function.args
+    if not args:
+        raise ValueError(f"Can't shift ASP function with no arguments: {str(asp_function)}")
+    return asp.AspFunction(args[0], args[1:])
+
+
+def compare_specs(a, b, to_string=False, color=None, ignore_packages=None):
     """
     Generate a comparison, including diffs (for each side) and an intersection.
 
@@ -65,11 +76,33 @@ def compare_specs(a, b, to_string=False, color=None):
     if color is None:
         color = get_color_when()
 
-    # Prepare a solver setup to parse differences
-    setup = asp.SpackSolverSetup()
+    a = a.copy()
+    b = b.copy()
 
-    a_facts = set(t for t in setup.spec_clauses(a, body=True, expand_hashes=True))
-    b_facts = set(t for t in setup.spec_clauses(b, body=True, expand_hashes=True))
+    if ignore_packages:
+        for pkg_name in ignore_packages:
+            a.trim(pkg_name)
+            b.trim(pkg_name)
+
+    # Prepare a clause generator to parse differences
+    generator = clauses.SpecClauseGenerator(repo=spack.repo.PATH)
+
+    # get facts for specs, making sure to include build dependencies of concrete
+    # specs and to descend into dependency hashes so we include all facts.
+    a_facts = {
+        shift(func)
+        for func in generator.spec_clauses(
+            a, body=True, expand_hashes=True, concrete_build_deps=True, include_runtimes=True
+        )
+        if func.name == "attr"
+    }
+    b_facts = {
+        shift(func)
+        for func in generator.spec_clauses(
+            b, body=True, expand_hashes=True, concrete_build_deps=True, include_runtimes=True
+        )
+        if func.name == "attr"
+    }
 
     # We want to present them to the user as simple key: values
     intersect = sorted(a_facts.intersection(b_facts))
@@ -114,8 +147,8 @@ def print_difference(c, attributes="all", out=None):
     # Default to standard out unless another stream is provided
     out = out or sys.stdout
 
-    A = c['b_not_a']
-    B = c['a_not_b']
+    A = c["b_not_a"]
+    B = c["a_not_b"]
 
     cprint("@R{--- %s}" % c["a_name"])  # bright red
     cprint("@G{+++ %s}" % c["b_name"])  # bright green
@@ -175,23 +208,29 @@ def print_difference(c, attributes="all", out=None):
 
 
 def diff(parser, args):
-    env = ev.active_environment()
+    env = active_environment()
 
     if len(args.specs) != 2:
-        tty.die("You must provide two specs to diff.")
+        args.subparser.error("you must provide two specs to diff")
 
-    specs = [spack.cmd.disambiguate_spec(spec, env, first=args.load_first)
-             for spec in spack.cmd.parse_specs(args.specs)]
+    specs = []
+    for spec in spack.cmd.parse_specs(args.specs):
+        # If the spec has a hash, check it before disambiguating
+        spack.hash_lookup.replace_hash(spec)
+        if spec.concrete:
+            specs.append(spec)
+        else:
+            specs.append(spack.cmd.disambiguate_spec(spec, env, first=args.load_first))
 
     # Calculate the comparison (c)
     color = False if args.dump_json else get_color_when()
-    c = compare_specs(specs[0], specs[1], to_string=True, color=color)
+    c = compare_specs(specs[0], specs[1], to_string=True, color=color, ignore_packages=args.ignore)
 
     # Default to all attributes
     attributes = args.attribute or ["all"]
 
     if args.dump_json:
-        print(sjson.dump(c))
+        print(sjson.dumps(c))
     else:
         tty.warn("This interface is subject to change.\n")
         print_difference(c, attributes)

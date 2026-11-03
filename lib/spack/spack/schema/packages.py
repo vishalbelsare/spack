@@ -1,200 +1,482 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Schema for packages.yaml configuration files.
 
 .. literalinclude:: _spack_root/lib/spack/spack/schema/packages.py
-   :lines: 13-
+   :lines: 14-
 """
 
+from typing import Any, Dict
 
-def deprecate_paths_and_modules(instance, deprecated_properties):
-    """Function to produce warning/error messages if "paths" and "modules" are
-    found in "packages.yaml"
+import spack.schema.environment
+from spack.enums import DeprecationReason
 
-    Args:
-        instance: instance of the configuration file
-        deprecated_properties: deprecated properties in instance
-
-    Returns:
-        Warning/Error message to be printed
-    """
-    import copy
-    import os.path
-
-    import llnl.util.tty
-
-    import spack.util.spack_yaml as syaml
-
-    # Copy the instance to remove default attributes that are not related
-    # to the part that needs to be reported
-    instance_copy = copy.copy(instance)
-
-    # Check if this configuration comes from an environment or not
-    absolute_path = instance_copy._end_mark.name
-    command_to_suggest = '$ spack config update packages'
-    if os.path.basename(absolute_path) == 'spack.yaml':
-        command_to_suggest = '$ spack env update <environment>'
-
-    # Retrieve the relevant part of the configuration as YAML
-    keys_to_be_removed = [
-        x for x in instance_copy if x not in deprecated_properties
-    ]
-    for key in keys_to_be_removed:
-        instance_copy.pop(key)
-    yaml_as_str = syaml.dump_config(instance_copy, blame=True)
-
-    if llnl.util.tty.is_debug():
-        msg = 'OUTDATED CONFIGURATION FILE [file={0}]\n{1}'
-        llnl.util.tty.debug(msg.format(absolute_path, yaml_as_str))
-
-    msg = ('detected deprecated properties in {0}\nActivate the debug '
-           'flag to have more information on the deprecated parts or '
-           'run:\n\n\t{2}\n\nto update the file to the new format\n')
-    return msg.format(
-        absolute_path, yaml_as_str, command_to_suggest
-    )
-
-
-#: Properties for inclusion in other schemas
-properties = {
-    'packages': {
-        'type': 'object',
-        'default': {},
-        'additionalProperties': False,
-        'patternProperties': {
-            r'\w[\w-]*': {  # package name
-                'type': 'object',
-                'default': {},
-                'additionalProperties': False,
-                'properties': {
-                    'version': {
-                        'type': 'array',
-                        'default': [],
-                        # version strings
-                        'items': {'anyOf': [{'type': 'string'},
-                                            {'type': 'number'}]}},
-                    'target': {
-                        'type': 'array',
-                        'default': [],
-                        # target names
-                        'items': {'type': 'string'},
-                    },
-                    'compiler': {
-                        'type': 'array',
-                        'default': [],
-                        'items': {'type': 'string'}},  # compiler specs
-                    'buildable': {
-                        'type':  'boolean',
-                        'default': True,
-                    },
-                    'permissions': {
-                        'type': 'object',
-                        'additionalProperties': False,
-                        'properties': {
-                            'read': {
-                                'type':  'string',
-                                'enum': ['user', 'group', 'world'],
-                            },
-                            'write': {
-                                'type':  'string',
-                                'enum': ['user', 'group', 'world'],
-                            },
-                            'group': {
-                                'type':  'string',
-                            },
-                        },
-                    },
-                    'providers': {
-                        'type':  'object',
-                        'default': {},
-                        'additionalProperties': False,
-                        'patternProperties': {
-                            r'\w[\w-]*': {
-                                'type': 'array',
-                                'default': [],
-                                'items': {'type': 'string'}, }, }, },
-                    'variants': {
-                        'oneOf': [
-                            {'type': 'string'},
-                            {'type': 'array',
-                             'items': {'type': 'string'}}],
-                    },
-                    'externals': {
-                        'type': 'array',
-                        'items': {
-                            'type': 'object',
-                            'properties': {
-                                'spec': {'type': 'string'},
-                                'prefix': {'type': 'string'},
-                                'modules': {'type': 'array',
-                                            'items': {'type': 'string'}},
-                                'extra_attributes': {'type': 'object'}
-                            },
-                            'additionalProperties': True,
-                            'required': ['spec']
-                        }
-                    },
-                    # Deprecated properties, will trigger an error with a
-                    # message telling how to update.
-                    'paths': {'type': 'object'},
-                    'modules': {'type': 'object'},
-                },
-                'deprecatedProperties': {
-                    'properties': ['modules', 'paths'],
-                    'message': deprecate_paths_and_modules,
-                    'error': False
-                }
-            },
+flags: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "description": "Flags to pass to the compiler during compilation and linking",
+    "properties": {
+        "cflags": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Flags for C compiler, e.g. -std=c11",
+        },
+        "cxxflags": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Flags for C++ compiler, e.g. -std=c++14",
+        },
+        "fflags": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Flags for Fortran 77 compiler, e.g. -ffixed-line-length-none",
+        },
+        "cppflags": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Flags for C preprocessor, e.g. -DFOO=1",
+        },
+        "ldflags": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Flags passed to the compiler driver during linking, e.g. "
+            "-Wl,--gc-sections",
+        },
+        "ldlibs": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Flags for linker libraries, e.g. -lpthread",
         },
     },
 }
 
 
+extra_rpaths: Dict[str, Any] = {
+    "type": "array",
+    "default": [],
+    "items": {"type": "string"},
+    "description": "List of extra rpaths to inject by Spack's compiler wrappers",
+}
+
+implicit_rpaths: Dict[str, Any] = {
+    "anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "boolean"}],
+    "description": "List of non-default link directories to register at runtime as rpaths",
+}
+
+permissions = {
+    "type": "object",
+    "description": "File permissions settings for package installations",
+    "additionalProperties": False,
+    "properties": {
+        "read": {
+            "type": "string",
+            "enum": ["user", "group", "world"],
+            "description": "Who can read the files installed by a package",
+        },
+        "write": {
+            "type": "string",
+            "enum": ["user", "group", "world"],
+            "description": "Who can write to the files installed by a package",
+        },
+        "group": {
+            "type": "string",
+            "description": "The group that owns the files installed by a package",
+        },
+    },
+}
+
+variants = {
+    "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+    "description": "Soft variant preferences as a single spec string or list of variant "
+    "specifications (ignored if the concretizer can reuse existing installations)",
+}
+
+requirements = {
+    "description": "Package requirements that must be satisfied during concretization",
+    "oneOf": [
+        # 'require' can be a list of requirement_groups. each requirement group is a list of one or
+        # more specs. Either at least one or exactly one spec in the group must be satisfied
+        # (depending on whether you use "any_of" or "one_of", respectively)
+        {
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "one_of": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of specs where exactly one must be satisfied",
+                            },
+                            "any_of": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of specs where at least one must be "
+                                "satisfied",
+                            },
+                            "spec": {
+                                "type": "string",
+                                "description": "Single spec requirement that must be satisfied",
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Custom error message when requirement is not "
+                                "satisfiable",
+                            },
+                            "when": {
+                                "type": "string",
+                                "description": "Conditional spec that triggers this requirement",
+                            },
+                        },
+                    },
+                    {"type": "string"},
+                ]
+            },
+        },
+        # Shorthand for a single requirement group with one member
+        {"type": "string"},
+    ],
+}
+
+prefer_and_conflict = {
+    "type": "array",
+    "items": {
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "spec": {"type": "string", "description": "Spec constraint to apply"},
+                    "message": {
+                        "type": "string",
+                        "description": "Custom message explaining the constraint",
+                    },
+                    "when": {
+                        "type": "string",
+                        "description": "Conditional spec that triggers this constraint",
+                    },
+                },
+            },
+            {"type": "string"},
+        ]
+    },
+}
+
+package_attributes = {
+    "type": "object",
+    "description": "Class-level attributes to assign to package instances "
+    "(accessible in package.py methods)",
+    "additionalProperties": False,
+    "patternProperties": {r"^[a-zA-Z_]\w*$": {}},
+}
+
+severity_value = {"type": "string", "enum": ["none", "low", "medium", "high", "critical"]}
+
+reason_value = {"type": "string", "enum": [x.value for x in DeprecationReason]}
+
+# Keys within one selector are AND-ed, and a key that is omitted matches anything
+deprecation_selector = {
+    "type": "object",
+    "description": "Selects the deprecations to allow. 'severity' is a maximum, so 'medium' "
+    "also selects 'low'. A deprecation that declares labels is selected label by label, and a "
+    "label is selected if it is listed here.",
+    "additionalProperties": False,
+    "minProperties": 1,
+    "properties": {
+        "reason": {
+            "oneOf": [reason_value, {"type": "array", "minItems": 1, "items": reason_value}]
+        },
+        "severity": severity_value,
+        "labels": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    },
+}
+
+deprecation_allow = {
+    "type": "array",
+    "description": "Deprecations to allow. A deprecated() directive matched by at least one "
+    "entry is skipped, or, if it declares labels, one whose labels are each matched by an entry. "
+    "Any other one is a concretization error. The default is to allow none of them.",
+    "default": [],
+    "items": deprecation_selector,
+}
+
+deprecation_scope = {
+    "type": "string",
+    "description": "Which dependencies are checked against the deprecation policy. "
+    "'runtime' checks only the link/run closure of the requested packages; 'all' checks "
+    "every node in the DAG, including build dependencies of build dependencies.",
+    "enum": ["runtime", "all"],
+    "default": "runtime",
+}
+
+# 'scope' selects the deptypes of a single traversal, so it is global and only 'all' takes it
+deprecation_all = {
+    "type": "object",
+    "description": "Deprecation policy applied to every package",
+    "default": {},
+    "additionalProperties": False,
+    "properties": {"allow": deprecation_allow, "scope": deprecation_scope},
+}
+
+deprecation_pkg = {
+    "type": "object",
+    "description": "Deprecation policy for this package, replacing the one under 'all'",
+    "default": {},
+    "additionalProperties": False,
+    "properties": {"allow": deprecation_allow},
+}
+
+REQUIREMENT_URL = "https://spack.readthedocs.io/en/latest/packages_yaml.html#package-requirements"
+
+#: Properties for inclusion in other schemas
+properties: Dict[str, Any] = {
+    "packages": {
+        "type": "object",
+        "description": "Package-specific build settings and external package configurations",
+        "default": {},
+        "properties": {
+            "all": {
+                "type": "object",
+                "description": "Default settings that apply to all packages (can be overridden "
+                "by package-specific settings)",
+                "default": {},
+                "additionalProperties": False,
+                "properties": {
+                    "require": requirements,
+                    "prefer": {
+                        "description": "Strong package preferences that influence concretization "
+                        "without imposing hard constraints",
+                        **prefer_and_conflict,
+                    },
+                    "conflict": {
+                        "description": "Package conflicts that prevent certain spec combinations",
+                        **prefer_and_conflict,
+                    },
+                    # target names
+                    "target": {
+                        "type": "array",
+                        "description": "Ordered list of soft preferences for target "
+                        "architectures for all packages (ignored if the concretizer can reuse "
+                        "existing installations)",
+                        "default": [],
+                        "items": {"type": "string"},
+                    },
+                    # compiler specs
+                    "compiler": {
+                        "type": "array",
+                        "description": "Soft preferences for compiler specs for all packages "
+                        "(deprecated)",
+                        "default": [],
+                        "items": {"type": "string"},
+                    },
+                    "buildable": {
+                        "type": "boolean",
+                        "description": "Whether packages should be built from source (false "
+                        "prevents building)",
+                        "default": True,
+                    },
+                    "permissions": permissions,
+                    # If 'get_full_repo' is promoted to a Package-level
+                    # attribute, it could be useful to set it here
+                    "package_attributes": package_attributes,
+                    "providers": {
+                        "type": "object",
+                        "description": "Soft preferences for providers of virtual packages "
+                        "(ignored if the concretizer can reuse existing installations)",
+                        "default": {},
+                        "additionalProperties": {
+                            "type": "array",
+                            "description": "Ordered list of preferred providers for this virtual "
+                            "package",
+                            "default": [],
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "variants": variants,
+                    "deprecation": deprecation_all,
+                },
+                "deprecatedProperties": [
+                    {
+                        "names": ["compiler"],
+                        "message": "The packages:all:compiler preference has been deprecated in "
+                        "Spack v1.0, and is currently ignored. It will be removed from config in "
+                        "Spack v1.2.",
+                        "error": False,
+                    }
+                ],
+            }
+        },
+        # package names
+        "additionalProperties": {
+            "type": "object",
+            "description": "Package-specific settings that override defaults from 'all'",
+            "default": {},
+            "additionalProperties": False,
+            "properties": {
+                "require": requirements,
+                "prefer": {
+                    "description": "Strong package preferences that influence concretization "
+                    "without imposing hard constraints",
+                    **prefer_and_conflict,
+                },
+                "conflict": {
+                    "description": "Package conflicts that prevent certain spec combinations",
+                    **prefer_and_conflict,
+                },
+                "version": {
+                    "type": "array",
+                    "description": "Ordered list of soft preferences for versions for this "
+                    "package (ignored if the concretizer can reuse existing installations)",
+                    "default": [],
+                    # version strings
+                    "items": {"anyOf": [{"type": "string"}, {"type": "number"}]},
+                },
+                "buildable": {
+                    "type": "boolean",
+                    "description": "Whether this package should be built from source (false "
+                    "prevents building)",
+                    "default": True,
+                },
+                "permissions": permissions,
+                # If 'get_full_repo' is promoted to a Package-level
+                # attribute, it could be useful to set it here
+                "package_attributes": package_attributes,
+                "variants": variants,
+                "deprecation": deprecation_pkg,
+                "externals": {
+                    "type": "array",
+                    "description": "List of external, system-installed instances of this package",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "string",
+                                "description": "Spec string describing this external package "
+                                "instance. Typically name@version and relevant variants",
+                            },
+                            "prefix": {
+                                "type": "string",
+                                "description": "Installation prefix path for this external "
+                                "package (typically /usr, *excluding* bin/, lib/, etc.)",
+                            },
+                            "modules": {
+                                "type": "array",
+                                "description": "Environment modules to load for this external "
+                                "package",
+                                "items": {"type": "string"},
+                            },
+                            "id": {"type": "string"},
+                            "extra_attributes": {
+                                "type": "object",
+                                "description": "Additional information needed by the package "
+                                "to use this external",
+                                "additionalProperties": {"type": "string"},
+                                "properties": {
+                                    "compilers": {
+                                        "type": "object",
+                                        "description": "Compiler executable paths for external "
+                                        "compiler packages",
+                                        "properties": {
+                                            "c": {
+                                                "type": "string",
+                                                "description": "Path to the C compiler "
+                                                "executable (e.g. /usr/bin/gcc)",
+                                            },
+                                            "cxx": {
+                                                "type": "string",
+                                                "description": "Path to the C++ compiler "
+                                                "executable (e.g. /usr/bin/g++)",
+                                            },
+                                            "fortran": {
+                                                "type": "string",
+                                                "description": "Path to the Fortran compiler "
+                                                "executable (e.g. /usr/bin/gfortran)",
+                                            },
+                                        },
+                                        "patternProperties": {r"^\w": {"type": "string"}},
+                                        "additionalProperties": False,
+                                    },
+                                    "environment": spack.schema.environment.ref_env_modifications,
+                                    "extra_rpaths": extra_rpaths,
+                                    "implicit_rpaths": implicit_rpaths,
+                                    "flags": flags,
+                                },
+                            },
+                            "dependencies": {
+                                "type": "array",
+                                "description": "List of dependencies for this external package, "
+                                "specifying dependency relationships explicitly",
+                                "items": {
+                                    "type": "object",
+                                    "description": "Dependency specification for an external "
+                                    "package",
+                                    "properties": {
+                                        "id": {
+                                            "type": "string",
+                                            "description": "Explicit reference ID to another "
+                                            "external package (provides unambiguous reference)",
+                                        },
+                                        "spec": {
+                                            "type": "string",
+                                            "description": "Spec string that matches an "
+                                            "available external package",
+                                        },
+                                        "deptypes": {
+                                            "oneOf": [
+                                                {
+                                                    "type": "string",
+                                                    "description": "Single dependency type "
+                                                    "(e.g., 'build', 'link', 'run', 'test')",
+                                                },
+                                                {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "string",
+                                                        "description": "Dependency type (e.g., "
+                                                        "'build', 'link', 'run', 'test')",
+                                                    },
+                                                    "description": "List of dependency types "
+                                                    "(e.g., ['build', 'link'])",
+                                                },
+                                            ],
+                                            "description": "Dependency types; if not specified, "
+                                            "inferred from package recipe",
+                                        },
+                                        "virtuals": {
+                                            "type": "string",
+                                            "description": "Virtual package name this dependency "
+                                            "provides (e.g., 'mpi')",
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "additionalProperties": False,
+                        "required": ["spec"],
+                    },
+                },
+            },
+        },
+    }
+}
+
 #: Full schema with metadata
 schema = {
-    '$schema': 'http://json-schema.org/schema#',
-    'title': 'Spack package configuration file schema',
-    'type': 'object',
-    'additionalProperties': False,
-    'properties': properties,
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Spack package configuration file schema",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": properties,
+    "definitions": {"env_modifications": spack.schema.environment.env_modifications},
 }
 
 
 def update(data):
-    """Update the data in place to remove deprecated properties.
-
-    Args:
-        data (dict): dictionary to be updated
-
-    Returns:
-        True if data was changed, False otherwise
-    """
+    data = data["packages"]
     changed = False
-    for cfg_object in data.values():
-        externals = []
-
-        # If we don't have these deprecated attributes, continue
-        if not any(x in cfg_object for x in ('paths', 'modules')):
+    for key in data:
+        version = data[key].get("version")
+        if not version or all(isinstance(v, str) for v in version):
             continue
 
-        # If we arrive here we need to make some changes i.e.
-        # we need to remove and eventually convert some attributes
+        data[key]["version"] = [str(v) for v in version]
         changed = True
-        paths = cfg_object.pop('paths', {})
-        for spec, prefix in paths.items():
-            externals.append({
-                'spec': str(spec),
-                'prefix': str(prefix)
-            })
-        modules = cfg_object.pop('modules', {})
-        for spec, module in modules.items():
-            externals.append({
-                'spec': str(spec),
-                'modules': [str(module)]
-            })
-        if externals:
-            cfg_object['externals'] = externals
 
     return changed

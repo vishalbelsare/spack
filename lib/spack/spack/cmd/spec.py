@@ -1,115 +1,138 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-from __future__ import print_function
-
-import contextlib
+import argparse
 import sys
 
-import llnl.util.tty as tty
-
 import spack
+import spack.binary_distribution
 import spack.cmd
-import spack.cmd.common.arguments as arguments
-import spack.hash_types as ht
+import spack.package_base
 import spack.spec
 import spack.store
+import spack.traverse
+from spack.active_environment import active_environment
+from spack.cmd.common import arguments
+from spack.concretize_ui import HeadlessUI, TerminalUI
+from spack.util.lang import nullcontext
 
 description = "show what would be installed, given a spec"
 section = "build"
 level = "short"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.epilog = """\
+when an environment is active and no specs are provided, the environment root \
+specs are used instead
+
 for further documentation regarding the spec syntax, see:
     spack help --spec
 """
-    arguments.add_common_arguments(
-        subparser, ['long', 'very_long', 'install_status', 'reuse']
+    arguments.add_common_arguments(subparser, ["long", "very_long", "namespaces"])
+
+    install_status_group = subparser.add_mutually_exclusive_group()
+    arguments.add_common_arguments(install_status_group, ["install_status", "no_install_status"])
+    format_group = subparser.add_mutually_exclusive_group()
+    format_group.add_argument(
+        "-y",
+        "--yaml",
+        action="store_const",
+        dest="format",
+        default=None,
+        const="yaml",
+        help="print concrete spec as YAML",
+    )
+    format_group.add_argument(
+        "-j",
+        "--json",
+        action="store_const",
+        dest="format",
+        default=None,
+        const="json",
+        help="print concrete spec as JSON",
+    )
+    format_group.add_argument(
+        "--format",
+        action="store",
+        default=None,
+        help="print concrete spec with the specified format string",
+    )
+    arguments.add_common_arguments(format_group, ["show_non_defaults"])
+
+    subparser.add_argument(
+        "-c",
+        "--cover",
+        action="store",
+        default="nodes",
+        choices=["nodes", "edges", "paths"],
+        help="how extensively to traverse the DAG (default: nodes)",
     )
     subparser.add_argument(
-        '-y', '--yaml', action='store_const', dest='format', default=None,
-        const='yaml', help='print concrete spec as YAML')
-    subparser.add_argument(
-        '-j', '--json', action='store_const', dest='format', default=None,
-        const='json', help='print concrete spec as JSON')
-    subparser.add_argument(
-        '-c', '--cover', action='store',
-        default='nodes', choices=['nodes', 'edges', 'paths'],
-        help='how extensively to traverse the DAG (default: nodes)')
-    subparser.add_argument(
-        '-N', '--namespaces', action='store_true', default=False,
-        help='show fully qualified package names')
-    subparser.add_argument(
-        '--hash-type', default="build_hash",
-        choices=['build_hash', 'full_hash', 'dag_hash'],
-        help='generate spec with a particular hash type.')
-    subparser.add_argument(
-        '-t', '--types', action='store_true', default=False,
-        help='show dependency types')
-    arguments.add_common_arguments(subparser, ['specs'])
-
-
-@contextlib.contextmanager
-def nullcontext():
-    """Empty context manager.
-    TODO: replace with contextlib.nullcontext() if we ever require python 3.7.
-    """
-    yield
+        "-t", "--types", action="store_true", default=False, help="show dependency types"
+    )
+    arguments.add_common_arguments(subparser, ["specs"])
+    arguments.add_concretizer_args(subparser)
 
 
 def spec(parser, args):
-    name_fmt = '{namespace}.{name}' if args.namespaces else '{name}'
-    fmt = '{@version}{%compiler}{compiler_flags}{variants}{arch=architecture}'
-    install_status_fn = spack.spec.Spec.install_status
-    tree_kwargs = {
-        'cover': args.cover,
-        'format': name_fmt + fmt,
-        'hashlen': None if args.very_long else 7,
-        'show_types': args.types,
-        'status_fn': install_status_fn if args.install_status else None
-    }
+    fmt = spack.spec.DISPLAY_FORMAT
+    if args.namespaces:
+        fmt = "{namespace}." + fmt
+
+    env = active_environment()
+
+    # Machine-readable output goes to stdout, so concretization must not print anything there
+    ui = HeadlessUI() if args.format else TerminalUI()
+
+    if args.specs:
+        concrete_specs = spack.cmd.parse_specs(args.specs, concretize=True, ui=ui)
+    elif env:
+        env.concretize(ui=ui)
+        concrete_specs = env.concrete_roots()
+    else:
+        args.subparser.error("requires at least one spec or an active environment")
+
+    show_status = args.install_status
+    if show_status:
+        spack.binary_distribution.load_buildcache_index()
+        status_fn = spack.cmd.buildcache_status_fn(spack.binary_distribution.BINARY_INDEX)
+    else:
+        status_fn = None
 
     # use a read transaction if we are getting install status for every
     # spec in the DAG.  This avoids repeatedly querying the DB.
-    tree_context = nullcontext
-    if args.install_status:
-        tree_context = spack.store.db.read_transaction
+    tree_context = spack.store.STORE.db.read_transaction if show_status else nullcontext
 
-    if not args.specs:
-        tty.die("spack spec requires at least one spec")
-
-    concretize_kwargs = {
-        'reuse': args.reuse
-    }
-
-    for spec in spack.cmd.parse_specs(args.specs):
-        # With -y, just print YAML to output.
-        if args.format:
-            if spec.name in spack.repo.path or spec.virtual:
-                spec.concretize(**concretize_kwargs)
-
-            # The user can specify the hash type to use
-            hash_type = getattr(ht, args.hash_type)
-
-            if args.format == 'yaml':
+    # With --yaml, --json, or --format, just print the raw specs to output
+    if args.format:
+        for spec in concrete_specs:
+            if args.format == "yaml":
                 # use write because to_yaml already has a newline.
-                sys.stdout.write(spec.to_yaml(hash=hash_type))
+                sys.stdout.write(spec.to_yaml())
+            elif args.format == "json":
+                print(spec.to_json())
             else:
-                print(spec.to_json(hash=hash_type))
-            continue
+                print(spec.format(args.format))
+        return
 
-        with tree_context():
-            tree_kwargs['hashes'] = False  # Always False for input spec
-            print("Input spec")
-            print("--------------------------------")
-            print(spec.tree(**tree_kwargs))
-
-            tree_kwargs['hashes'] = args.long or args.very_long
-            print("Concretized")
-            print("--------------------------------")
-            spec.concretize(**concretize_kwargs)
-            print(spec.tree(**tree_kwargs))
+    with tree_context():
+        print(
+            spack.spec.tree(
+                concrete_specs,
+                cover=args.cover,
+                format=fmt,
+                hashlen=None if args.very_long else 7,
+                show_types=args.types,
+                status_fn=status_fn,
+                hashes=args.long or args.very_long,
+                key=spack.traverse.by_dag_hash,
+                version_style_fn=(
+                    spack.package_base.non_preferred_version if args.non_defaults else None
+                ),
+                variant_style_fn=(
+                    spack.package_base.non_default_variant if args.non_defaults else None
+                ),
+            )
+        )

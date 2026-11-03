@@ -1,43 +1,59 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import argparse
+
+import spack.binary_distribution
 import spack.cmd
 import spack.cmd.common.arguments
 import spack.environment as ev
+from spack.concretize_ui import TerminalUI
+from spack.util import tty
+from spack.util.string import plural
 
-description = 'concretize an environment and write a lockfile'
+description = "concretize an environment and write a lockfile"
 section = "environments"
 level = "long"
 
 
-def setup_parser(subparser):
-    spack.cmd.common.arguments.add_common_arguments(subparser, ['reuse'])
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
-        '-f', '--force', action='store_true',
-        help="Re-concretize even if already concretized.")
+        "--test",
+        default=None,
+        choices=["root", "all"],
+        help="concretize with test dependencies of only root packages or all packages",
+    )
     subparser.add_argument(
-        '--test', default=None,
-        choices=['root', 'all'],
-        help="""Concretize with test dependencies. When 'root' is chosen, test
-dependencies are only added for the environment's root specs. When 'all' is
-chosen, test dependencies are enabled for all packages in the environment.""")
+        "-q", "--quiet", action="store_true", help="don't print concretized specs"
+    )
+
+    spack.cmd.common.arguments.add_concretizer_args(subparser)
+    spack.cmd.common.arguments.add_common_arguments(subparser, ["jobs", "show_non_defaults"])
 
 
 def concretize(parser, args):
-    env = spack.cmd.require_active_env(cmd_name='concretize')
+    env = spack.cmd.require_active_env(args.subparser)
 
-    if args.test == 'all':
+    if args.test == "all":
         tests = True
-    elif args.test == 'root':
+    elif args.test == "root":
         tests = [spec.name for spec in env.user_specs]
     else:
         tests = False
 
     with env.write_transaction():
-        concretized_specs = env.concretize(
-            force=args.force, tests=tests, reuse=args.reuse
-        )
-        ev.display_specs(concretized_specs)
+        concretized_specs = env.concretize(tests=tests, ui=TerminalUI())
+        if not args.quiet:
+            if concretized_specs:
+                tty.msg(f"Concretized {plural(len(concretized_specs), 'spec')}:")
+                spack.binary_distribution.load_buildcache_index()
+                status_fn = spack.cmd.buildcache_status_fn(spack.binary_distribution.BINARY_INDEX)
+                ev.display_specs(
+                    [concrete for _, concrete in concretized_specs],
+                    highlight_non_defaults=args.non_defaults,
+                    status_fn=status_fn,
+                )
+            else:
+                tty.msg("No new specs to concretize.")
         env.write()

@@ -1,69 +1,48 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-"""Simple wrapper around JSON to guarantee consistent use of load/dump. """
-import json
-import sys
+"""Simple wrapper around JSON to guarantee consistent use of load/dump."""
 
-from six import iteritems, string_types
+import json
+from typing import IO, Any, Dict
 
 import spack.error
 
-__all__ = ['load', 'dump', 'SpackJSONError']
+__all__ = ["load", "dump", "dumps", "SpackJSONError"]
 
-_json_dump_args = {
-    'indent': 2,
-    'separators': (',', ': ')
-}
+_DEFAULT_SEPARATORS = (",", ":")
+_DEFAULT_INDENT = None
+_PRETTY_SEPARATORS = (", ", ": ")
+_PRETTY_INDENT = "  "
+_WRITE_SIZE = 1024 * 1024
 
 
-def load(stream):
+def load(stream: Any) -> Dict:
     """Spack JSON needs to be ordered to support specs."""
-    if isinstance(stream, string_types):
-        load = json.loads
-    else:
-        load = json.load
-
-    return _strify(load(stream, object_hook=_strify), ignore_dicts=True)
+    if isinstance(stream, str):
+        return json.loads(stream)
+    return json.load(stream)
 
 
-def dump(data, stream=None):
-    """Dump JSON with a reasonable amount of indentation and separation."""
-    if stream is None:
-        return json.dumps(data, **_json_dump_args)
-    else:
-        return json.dump(data, stream, **_json_dump_args)
+def dump(data: Any, stream: IO[str], pretty: bool = False) -> None:
+    """Wrapper around json.dump with different default arguments"""
+    # json.dump encodes in Python; json.dumps uses the C encoder and is several times faster.
+    text = dumps(data, pretty=pretty)
+    # Write in slices, so that the stream does not hold an encoded copy of the whole document.
+    for i in range(0, len(text), _WRITE_SIZE):
+        stream.write(text[i : i + _WRITE_SIZE])
 
 
-def _strify(data, ignore_dicts=False):
-    """Converts python 2 unicodes to str in JSON data."""
-    # this is a no-op in python 3
-    if sys.version_info[0] >= 3:
-        return data
-
-    # if this is a unicode string in python 2, return its string representation
-    if isinstance(data, string_types):
-        return data.encode('utf-8')
-
-    # if this is a list of values, return list of byteified values
-    if isinstance(data, list):
-        return [_strify(item, ignore_dicts=True) for item in data]
-
-    # if this is a dictionary, return dictionary of byteified keys and values
-    # but only if we haven't already byteified it
-    if isinstance(data, dict) and not ignore_dicts:
-        return dict((_strify(key, ignore_dicts=True),
-                     _strify(value, ignore_dicts=True)) for key, value in
-                    iteritems(data))
-
-    # if it's anything else, return it in its original form
-    return data
+def dumps(data: Any, pretty: bool = False) -> str:
+    """Wrapper around json.dumps with different default arguments"""
+    indent = _PRETTY_INDENT if pretty else _DEFAULT_INDENT
+    separators = _PRETTY_SEPARATORS if pretty else _DEFAULT_SEPARATORS
+    return json.dumps(data, separators=separators, indent=indent)
 
 
 class SpackJSONError(spack.error.SpackError):
     """Raised when there are issues with JSON parsing."""
 
-    def __init__(self, msg, json_error):
-        super(SpackJSONError, self).__init__(msg, str(json_error))
+    def __init__(self, msg: str, json_error: BaseException):
+        super().__init__(msg, str(json_error))

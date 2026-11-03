@@ -1,9 +1,6 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-
-from __future__ import print_function
 
 import argparse
 import code
@@ -12,38 +9,56 @@ import platform
 import runpy
 import sys
 
-import llnl.util.tty as tty
-
 import spack
+import spack.repo
+from spack.util import tty
 
 description = "launch an interpreter as spack would launch a command"
 section = "developer"
 level = "long"
 
+IS_WINDOWS = sys.platform == "win32"
 
-def setup_parser(subparser):
+
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
-        '-V', '--version', action='store_true', dest='python_version',
-        help='print the Python version number and exit')
+        "-V",
+        "--version",
+        action="store_true",
+        dest="python_version",
+        help="print the Python version number and exit",
+    )
+    subparser.add_argument("-c", dest="python_command", help="command to execute")
     subparser.add_argument(
-        '-c', dest='python_command', help='command to execute')
+        "-u",
+        dest="unbuffered",
+        action="store_true",
+        help="for compatibility with xdist, do not use without adding -u to the interpreter",
+    )
     subparser.add_argument(
-        '-i', dest='python_interpreter', help='python interpreter',
-        choices=['python', 'ipython'], default='python')
+        "-i",
+        dest="python_interpreter",
+        help="python interpreter",
+        choices=["python", "ipython"],
+        default="python",
+    )
     subparser.add_argument(
-        '-m', dest='module', action='store',
-        help='run library module as a script')
+        "-m", dest="module", action="store", help="run library module as a script"
+    )
     subparser.add_argument(
-        '--path', action='store_true', dest='show_path',
-        help='show path to python interpreter that spack uses')
+        "--path",
+        action="store_true",
+        dest="show_path",
+        help="show path to python interpreter that spack uses",
+    )
     subparser.add_argument(
-        'python_args', nargs=argparse.REMAINDER,
-        help="file to run plus arguments")
+        "python_args", nargs=argparse.REMAINDER, help="file to run plus arguments"
+    )
 
 
 def python(parser, args, unknown_args):
     if args.python_version:
-        print('Python', platform.python_version())
+        print("Python", platform.python_version())
         return
 
     if args.show_path:
@@ -51,21 +66,24 @@ def python(parser, args, unknown_args):
         return
 
     if args.module:
-        sys.argv = ['spack-python'] + unknown_args + args.python_args
+        sys.argv = ["spack-python"] + unknown_args + args.python_args
         runpy.run_module(args.module, run_name="__main__", alter_sys=True)
         return
 
     if unknown_args:
-        tty.die("Unknown arguments:", " ".join(unknown_args))
+        args.subparser.error("unrecognized arguments: %s" % " ".join(unknown_args))
 
     # Unexpected behavior from supplying both
     if args.python_command and args.python_args:
-        tty.die("You can only specify a command OR script, but not both.")
+        args.subparser.error("you can only specify a command OR script, but not both")
+
+    # Ensure that spack.repo.PATH is initialized
+    spack.repo.PATH.repos
 
     # Run user choice of interpreter
     if args.python_interpreter == "ipython":
-        return spack.cmd.python.ipython_interpreter(args)
-    return spack.cmd.python.python_interpreter(args)
+        return ipython_interpreter(args)
+    return python_interpreter(args)
 
 
 def ipython_interpreter(args):
@@ -73,52 +91,81 @@ def ipython_interpreter(args):
     support running a script or arguments
     """
     try:
-        import IPython
+        import IPython  # type: ignore[import]
     except ImportError:
         tty.die("ipython is not installed, install and try again.")
 
     if "PYTHONSTARTUP" in os.environ:
         startup_file = os.environ["PYTHONSTARTUP"]
         if os.path.isfile(startup_file):
-            with open(startup_file) as startup:
+            with open(startup_file, encoding="utf-8") as startup:
                 exec(startup.read())
 
     # IPython can also support running a script OR command, not both
     if args.python_args:
         IPython.start_ipython(argv=args.python_args)
     elif args.python_command:
-        IPython.start_ipython(argv=['-c', args.python_command])
+        IPython.start_ipython(argv=["-c", args.python_command])
     else:
-        header = ("Spack version %s\nPython %s, %s %s"
-                  % (spack.spack_version, platform.python_version(),
-                     platform.system(), platform.machine()))
+        header = "Spack version %s\nPython %s, %s %s" % (
+            spack.spack_version,
+            platform.python_version(),
+            platform.system(),
+            platform.machine(),
+        )
 
-        __name__ = "__main__"  # noqa
+        __name__ = "__main__"  # noqa: F841
         IPython.embed(module="__main__", header=header)
 
 
 def python_interpreter(args):
-    """A python interpreter is the default interpreter
-    """
-    # Fake a main python shell by setting __name__ to __main__.
-    console = code.InteractiveConsole({'__name__': '__main__',
-                                       'spack': spack})
-    if "PYTHONSTARTUP" in os.environ:
-        startup_file = os.environ["PYTHONSTARTUP"]
-        if os.path.isfile(startup_file):
-            with open(startup_file) as startup:
-                console.runsource(startup.read(), startup_file, 'exec')
+    """A python interpreter is the default interpreter"""
 
-    if args.python_command:
-        console.runsource(args.python_command)
-    elif args.python_args:
+    if args.python_args and not args.python_command:
         sys.argv = args.python_args
-        with open(args.python_args[0]) as file:
-            console.runsource(file.read(), args.python_args[0], 'exec')
+        runpy.run_path(args.python_args[0], run_name="__main__")
     else:
-        # Provides readline support, allowing user to use arrow keys
-        console.push('import readline')
+        # Fake a main python shell by setting __name__ to __main__.
+        console = code.InteractiveConsole({"__name__": "__main__", "spack": spack})
+        if "PYTHONSTARTUP" in os.environ:
+            startup_file = os.environ["PYTHONSTARTUP"]
+            if os.path.isfile(startup_file):
+                with open(startup_file, encoding="utf-8") as startup:
+                    console.runsource(startup.read(), startup_file, "exec")
+        if args.python_command:
+            propagate_exceptions_from(console)
+            console.runsource(args.python_command)
+        else:
+            # no readline module on Windows
+            if not IS_WINDOWS:
+                # Provides readline support, allowing user to use arrow keys
+                console.push("import readline")
+                # Provide tabcompletion
+                console.push("from rlcompleter import Completer")
+                console.push("readline.set_completer(Completer(locals()).complete)")
+                console.push('readline.parse_and_bind("tab: complete")')
 
-        console.interact("Spack version %s\nPython %s, %s %s"
-                         % (spack.spack_version, platform.python_version(),
-                            platform.system(), platform.machine()))
+            console.interact(
+                "Spack version %s\nPython %s, %s %s"
+                % (
+                    spack.spack_version,
+                    platform.python_version(),
+                    platform.system(),
+                    platform.machine(),
+                )
+            )
+
+
+def propagate_exceptions_from(console):
+    """Set sys.excepthook to let uncaught exceptions return 1 to the shell.
+
+    Args:
+        console (code.InteractiveConsole): the console that needs a change in sys.excepthook
+    """
+    console.push("import sys")
+    console.push("_wrapped_hook = sys.excepthook")
+    console.push("def _hook(exc_type, exc_value, exc_tb):")
+    console.push("    _wrapped_hook(exc_type, exc_value, exc_tb)")
+    console.push("    sys.exit(1)")
+    console.push("")
+    console.push("sys.excepthook = _hook")

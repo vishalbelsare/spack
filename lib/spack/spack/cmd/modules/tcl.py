@@ -1,19 +1,52 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-
 import functools
 
+import spack.cmd.common.arguments
 import spack.cmd.modules
+import spack.config
+import spack.modules
+import spack.modules.common
+from spack.util import tty
 
 
 def add_command(parser, command_dict):
-    tcl_parser = parser.add_parser(
-        'tcl', help='manipulate non-hierarchical module files'
-    )
-    spack.cmd.modules.setup_parser(tcl_parser)
+    tcl_parser = parser.add_parser("tcl", help="manipulate tcl module files")
+    sp = spack.cmd.modules.setup_parser(tcl_parser)
 
-    command_dict['tcl'] = functools.partial(
-        spack.cmd.modules.modules_cmd, module_type='tcl'
+    # Set default module file for a package
+    setdefault_parser = sp.add_parser(
+        "setdefault", help="set the default module file for a package"
     )
+    spack.cmd.common.arguments.add_common_arguments(setdefault_parser, ["constraint"])
+
+    callbacks = dict(spack.cmd.modules.callbacks.items())
+    callbacks["setdefault"] = setdefault
+
+    command_dict["tcl"] = functools.partial(
+        spack.cmd.modules.modules_cmd, module_type="tcl", callbacks=callbacks
+    )
+
+
+def setdefault(module_type, specs, args):
+    """set the default module file, when multiple are present"""
+    # Currently, accepts only a single matching spec
+    spack.cmd.modules.one_spec_or_raise(specs)
+    spec = specs[0]
+    data = {"modules": {args.module_set_name: {"tcl": {"defaults": [str(spec)]}}}}
+    scope = spack.config.InternalConfigScope("tcl-setdefault", data)
+    root = spack.modules.common.root_path("tcl", args.module_set_name)
+    override = spack.config.CONFIG.override(scope)
+    transaction = spack.modules.common.module_root_transaction(root)
+    with override, transaction as cache:
+        writer = spack.modules.module_types["tcl"].from_spec(
+            spec, args.module_set_name, cache=cache
+        )
+        # The default symlink points to the module file, which holds the other installations too
+        if writer.has_other_installations:
+            tty.die(
+                f"Cannot set {spec.cshort_spec} as default: its module file holds other "
+                "installations and 'module load' selects the first one it lists by default"
+            )
+        writer.update_module_defaults()

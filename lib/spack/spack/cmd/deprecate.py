@@ -1,8 +1,7 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-'''Deprecate one Spack install in favor of another
+"""Deprecate one Spack install in favor of another
 
 Spack packages of different configurations cannot be installed to the same
 location. However, in some circumstances (e.g. security patches) old
@@ -12,77 +11,95 @@ place.
 
 It is up to the user to ensure binary compatibility between the deprecated
 installation and its deprecator.
-'''
-from __future__ import print_function
+"""
 
 import argparse
-import os
-
-import llnl.util.tty as tty
+from typing import List
 
 import spack.cmd
-import spack.cmd.common.arguments as arguments
-import spack.environment as ev
+import spack.concretize
+import spack.modules
+import spack.old_installer
+import spack.spec
 import spack.store
-from spack.database import InstallStatuses
-from spack.error import SpackError
+from spack.active_environment import active_environment
+from spack.cmd.common import arguments
+from spack.util import tty
+from spack.util.filesystem import symlink
 
-description = "Replace one package with another via symlinks"
+from ..enums import InstallRecordStatus
+
+description = "replace one package with another via symlinks"
 section = "admin"
 level = "long"
 
 # Arguments for display_specs when we find ambiguity
-display_args = {
-    'long': True,
-    'show_flags': True,
-    'variants': True,
-    'indent': 4,
-}
+display_args = {"long": True, "show_flags": True, "variants": True, "indent": 4}
 
 
-def setup_parser(sp):
-    setup_parser.parser = sp
+def setup_parser(sp: argparse.ArgumentParser) -> None:
+    setattr(setup_parser, "parser", sp)
 
-    arguments.add_common_arguments(sp, ['yes_to_all'])
+    arguments.add_common_arguments(sp, ["yes_to_all"])
 
     deps = sp.add_mutually_exclusive_group()
-    deps.add_argument('-d', '--dependencies', action='store_true',
-                      default=True, dest='dependencies',
-                      help='Deprecate dependencies (default)')
-    deps.add_argument('-D', '--no-dependencies', action='store_false',
-                      default=True, dest='dependencies',
-                      help='Do not deprecate dependencies')
+    deps.add_argument(
+        "-d",
+        "--dependencies",
+        action="store_true",
+        default=True,
+        dest="dependencies",
+        help="deprecate dependencies (default)",
+    )
+    deps.add_argument(
+        "-D",
+        "--no-dependencies",
+        action="store_false",
+        default=True,
+        dest="dependencies",
+        help="do not deprecate dependencies",
+    )
 
     install = sp.add_mutually_exclusive_group()
-    install.add_argument('-i', '--install-deprecator', action='store_true',
-                         default=False, dest='install',
-                         help='Concretize and install deprecator spec')
-    install.add_argument('-I', '--no-install-deprecator',
-                         action='store_false', default=False, dest='install',
-                         help='Deprecator spec must already be installed (default)')  # noqa 501
+    install.add_argument(
+        "-i",
+        "--install-deprecator",
+        action="store_true",
+        default=False,
+        dest="install",
+        help="concretize and install deprecator spec",
+    )
+    install.add_argument(
+        "-I",
+        "--no-install-deprecator",
+        action="store_false",
+        default=False,
+        dest="install",
+        help="deprecator spec must already be installed (default)",
+    )
 
-    sp.add_argument('-l', '--link-type', type=str,
-                    default='soft', choices=['soft', 'hard'],
-                    help="Type of filesystem link to use for deprecation (default soft)")  # noqa 501
-
-    sp.add_argument('specs', nargs=argparse.REMAINDER,
-                    help="spec to deprecate and spec to use as deprecator")
+    sp.add_argument(
+        "specs", nargs=argparse.REMAINDER, help="spec to deprecate and spec to use as deprecator"
+    )
 
 
 def deprecate(parser, args):
     """Deprecate one spec in favor of another"""
-    env = ev.active_environment()
+    env = active_environment()
     specs = spack.cmd.parse_specs(args.specs)
 
     if len(specs) != 2:
-        raise SpackError('spack deprecate requires exactly two specs')
+        args.subparser.error("requires exactly two specs")
 
-    install_query = [InstallStatuses.INSTALLED, InstallStatuses.DEPRECATED]
-    deprecate = spack.cmd.disambiguate_spec(specs[0], env, local=True,
-                                            installed=install_query)
+    deprecate = spack.cmd.disambiguate_spec(
+        specs[0],
+        env,
+        local=True,
+        installed=(InstallRecordStatus.INSTALLED | InstallRecordStatus.DEPRECATED),
+    )
 
     if args.install:
-        deprecator = specs[1].concretized()
+        deprecator = spack.concretize.concretize_one(specs[1])
     else:
         deprecator = spack.cmd.disambiguate_spec(specs[1], env, local=True)
 
@@ -90,9 +107,11 @@ def deprecate(parser, args):
     all_deprecate = []
     all_deprecators = []
 
-    generator = deprecate.traverse(
-        order='post', type='link', root=True
-    ) if args.dependencies else [deprecate]
+    generator = (
+        deprecate.traverse(order="post", deptype="link", root=True)
+        if args.dependencies
+        else [deprecate]
+    )
     for spec in generator:
         all_deprecate.append(spec)
         all_deprecators.append(deprecator[spec.name])
@@ -100,7 +119,7 @@ def deprecate(parser, args):
         # that matches the name of a dep of the spec
 
     if not args.yes_to_all:
-        tty.msg('The following packages will be deprecated:\n')
+        tty.msg("The following packages will be deprecated:\n")
         spack.cmd.display_specs(all_deprecate, **display_args)
         tty.msg("In favor of (respectively):\n")
         spack.cmd.display_specs(all_deprecators, **display_args)
@@ -109,21 +128,31 @@ def deprecate(parser, args):
         already_deprecated = []
         already_deprecated_for = []
         for spec in all_deprecate:
-            deprecated_for = spack.store.db.deprecator(spec)
+            deprecated_for = spack.store.STORE.db.deprecator(spec)
             if deprecated_for:
                 already_deprecated.append(spec)
                 already_deprecated_for.append(deprecated_for)
 
-        tty.msg('The following packages are already deprecated:\n')
+        tty.msg("The following packages are already deprecated:\n")
         spack.cmd.display_specs(already_deprecated, **display_args)
-        tty.msg('In favor of (respectively):\n')
+        tty.msg("In favor of (respectively):\n")
         spack.cmd.display_specs(already_deprecated_for, **display_args)
 
-        answer = tty.get_yes_or_no('Do you want to proceed?', default=False)
+        answer = tty.get_yes_or_no("Do you want to proceed?", default=False)
         if not answer:
-            tty.die('Will not deprecate any packages.')
+            tty.die("Will not deprecate any packages.")
 
-    link_fn = os.link if args.link_type == 'hard' else os.symlink
+    # Fail before touching the store if the database cannot be modified.
+    spack.store.STORE.db.ensure_latest_db_version()
 
-    for dcate, dcator in zip(all_deprecate, all_deprecators):
-        dcate.package.do_deprecate(dcator, link_fn)
+    recorded_specs: List[spack.spec.Spec] = []
+    try:
+        for dcate, dcator in zip(all_deprecate, all_deprecators):
+            spack.old_installer.deprecate(dcate, dcator, symlink, recorded_specs)
+    finally:
+        spack.modules.write_module_files(recorded_specs)
+        # deprecate() skips specs it cannot deprecate, and they keep their module files
+        db = spack.store.STORE.db
+        with db.read_transaction():
+            deprecated = [s for s in all_deprecate if db.deprecator(s)]
+        spack.modules.remove_module_files(deprecated)

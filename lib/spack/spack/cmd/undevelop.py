@@ -1,38 +1,74 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import llnl.util.tty as tty
+import argparse
 
 import spack.cmd
-import spack.cmd.common.arguments as arguments
+import spack.config
+import spack.spec
+from spack.cmd.common import arguments
+from spack.util import tty
 
-description = 'remove specs from an environment'
+description = "remove specs from an environment's develop: section"
 section = "environments"
 level = "long"
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
-        '-a', '--all', action='store_true',
-        help="remove all specs from (clear) the environment")
-    arguments.add_common_arguments(subparser, ['specs'])
+        "--no-modify-concrete-specs",
+        action="store_false",
+        dest="apply_changes",
+        help=(
+            "do not mutate concrete specs to remove dev_path provenance."
+            " This requires running `spack concretize -f` later to apply changes to concrete specs"
+        ),
+    )
+
+    subparser.add_argument(
+        "-a", "--all", action="store_true", help="remove all specs from (clear) the environment"
+    )
+
+    arguments.add_common_arguments(subparser, ["specs"])
+
+
+def _update_config(specs_to_remove):
+    def change_fn(dev_config):
+        modified = False
+        for spec in specs_to_remove:
+            if spec.name in dev_config:
+                tty.msg("Undevelop: removing {0}".format(spec.name))
+                del dev_config[spec.name]
+                modified = True
+        return modified
+
+    spack.config.CONFIG.update_all("develop", change_fn)
 
 
 def undevelop(parser, args):
-    env = spack.cmd.require_active_env(cmd_name='undevelop')
+    # TODO: when https://github.com/spack/spack/pull/35307 is merged,
+    # an active env is not required if a scope is specified
+    env = spack.cmd.require_active_env(args.subparser)
 
     if args.all:
-        specs = env.dev_specs.keys()
+        remove_specs = [spack.spec.Spec(s) for s in env.dev_specs]
     else:
-        specs = spack.cmd.parse_specs(args.specs)
+        remove_specs = spack.cmd.parse_specs(args.specs)
 
     with env.write_transaction():
-        changed = False
-        for spec in specs:
-            tty.msg('Removing %s from environment %s development specs'
-                    % (spec, env.name))
-            changed |= env.undevelop(spec)
-        if changed:
-            env.write()
+        _update_config(remove_specs)
+        if args.apply_changes:
+            env.apply_develop(remove_specs, paths=None)
+
+    updated_all_dev_specs = set(spack.config.CONFIG.get("develop"))
+
+    remove_spec_names = {x.name for x in remove_specs}
+    not_fully_removed = updated_all_dev_specs & remove_spec_names
+
+    if not_fully_removed:
+        tty.msg(
+            "The following specs could not be removed as develop specs"
+            " - see `spack config blame develop` to locate files requiring"
+            f" manual edits: {', '.join(not_fully_removed)}"
+        )

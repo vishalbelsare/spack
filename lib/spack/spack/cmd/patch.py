@@ -1,35 +1,52 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-import llnl.util.tty as tty
+import argparse
 
 import spack.cmd
-import spack.cmd.common.arguments as arguments
-import spack.repo
+import spack.config
+import spack.environment as ev
+import spack.package_base
+import spack.traverse
+from spack.active_environment import active_environment
+from spack.cmd.common import arguments
+from spack.util import tty
 
-description = "patch expanded archive sources in preparation for install"
+description = "patch expanded sources in preparation for install"
 section = "build"
 level = "long"
 
 
-def setup_parser(subparser):
-    arguments.add_common_arguments(
-        subparser, ['no_checksum', 'deprecated', 'specs'])
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
+    arguments.add_common_arguments(subparser, ["no_checksum", "specs"])
+    arguments.add_concretizer_args(subparser)
 
 
 def patch(parser, args):
     if not args.specs:
-        tty.die("patch requires at least one spec argument")
+        env = active_environment()
+        if not env:
+            args.subparser.error("requires a spec or an active environment")
+        return _patch_env(env)
 
     if args.no_checksum:
-        spack.config.set('config:checksum', False, scope='command_line')
+        spack.config.CONFIG.set("config:checksum", False, scope="command_line")
 
-    if args.deprecated:
-        spack.config.set('config:deprecated', True, scope='command_line')
-
-    specs = spack.cmd.parse_specs(args.specs, concretize=True)
+    specs = spack.cmd.parse_specs(args.specs, concretize=False)
+    specs = spack.cmd.matching_specs_from_env(specs)
     for spec in specs:
-        package = spack.repo.get(spec)
-        package.do_patch()
+        _patch(spec.package)
+
+
+def _patch_env(env: ev.Environment):
+    tty.msg(f"Patching specs from environment {env.name}")
+    for spec in spack.traverse.traverse_nodes(env.concrete_roots()):
+        _patch(spec.package)
+
+
+def _patch(pkg: spack.package_base.PackageBase):
+    pkg.stage.keep = True
+    with pkg.stage:
+        pkg.do_patch()
+    tty.msg(f"Patched {pkg.name} in {pkg.stage.path}")

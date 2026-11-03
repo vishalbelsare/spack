@@ -1,141 +1,170 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+"""Test class methods on PackageBase objects.
 
-"""Test class methods on Package objects.
-
-This doesn't include methods on package *instances* (like do_install(),
+This doesn't include methods on package *instances* (like do_patch(),
 etc.).  Only methods like ``possible_dependencies()`` that deal with the
 static DSL metadata for packages.
 """
 
 import os
+import pathlib
 import shutil
 
 import pytest
 
-import llnl.util.filesystem as fs
-
-import spack.package
-import spack.repo
+import spack.binary_distribution
+import spack.concretize
+import spack.deptypes as dt
+import spack.error
+import spack.install_test
+import spack.package_base
+import spack.spec
+import spack.store
+import spack.subprocess_context
+import spack.util.filesystem as fs
+from spack.error import InstallError
+from spack.package_base import PackageBase
+from spack.repo import RepoPath
+from spack.solver.input_analysis import NoStaticAnalysis, StaticAnalysis
+from spack.version import Version
 
 
 @pytest.fixture(scope="module")
-def mpi_names(mock_repo_path):
-    return [spec.name for spec in mock_repo_path.providers_for('mpi')]
+def compiler_names(mock_packages_repo):
+    return [spec.name for spec in mock_packages_repo.providers_for("c")]
 
 
 @pytest.fixture()
-def mpileaks_possible_deps(mock_packages, mpi_names):
+def mpileaks_possible_deps(mock_packages, mpi_names, compiler_names):
     possible = {
-        'callpath': set(['dyninst'] + mpi_names),
-        'low-priority-provider': set(),
-        'dyninst': set(['libdwarf', 'libelf']),
-        'fake': set(),
-        'libdwarf': set(['libelf']),
-        'libelf': set(),
-        'mpich': set(),
-        'mpich2': set(),
-        'mpileaks': set(['callpath'] + mpi_names),
-        'multi-provider-mpi': set(),
-        'zmpi': set(['fake']),
+        "callpath": set(["dyninst"] + mpi_names + compiler_names),
+        "low-priority-provider": set(),
+        "dyninst": set(["libdwarf", "libelf"] + compiler_names),
+        "fake": set(),
+        "gcc": set(compiler_names),
+        "intel-parallel-studio": set(),
+        "libdwarf": set(["libelf"] + compiler_names),
+        "libelf": set(compiler_names),
+        "llvm": {"gcc", "llvm"},
+        "mpich": set(compiler_names),
+        "mpich2": set(compiler_names),
+        "mpileaks": set(["callpath"] + mpi_names + compiler_names),
+        "multi-provider-mpi": set(),
+        "zmpi": set(["fake"] + compiler_names),
+        "compiler-with-deps": set(["binutils-for-test", "zlib"] + compiler_names),
+        "binutils-for-test": set(["zlib"] + compiler_names),
+        "zlib": set(),
     }
     return possible
 
 
-def test_possible_dependencies(mock_packages, mpileaks_possible_deps):
-    mpileaks = spack.repo.get('mpileaks')
-    assert mpileaks_possible_deps == (
-        mpileaks.possible_dependencies(expand_virtuals=True))
-
-    assert {
-        'callpath': set(['dyninst', 'mpi']),
-        'dyninst': set(['libdwarf', 'libelf']),
-        'libdwarf': set(['libelf']),
-        'libelf': set(),
-        'mpi': set(),
-        'mpileaks': set(['callpath', 'mpi']),
-    } == mpileaks.possible_dependencies(expand_virtuals=False)
-
-
-def test_possible_direct_dependencies(mock_packages, mpileaks_possible_deps):
-    mpileaks = spack.repo.get('mpileaks')
-    deps = mpileaks.possible_dependencies(transitive=False,
-                                          expand_virtuals=False)
-
-    assert {
-        'callpath': set(),
-        'mpi': set(),
-        'mpileaks': set(['callpath', 'mpi']),
-    } == deps
-
-
-def test_possible_dependencies_virtual(mock_packages, mpi_names):
-    expected = dict(
-        (name, set(spack.repo.get(name).dependencies))
-        for name in mpi_names
+@pytest.fixture(params=[NoStaticAnalysis, StaticAnalysis])
+def mock_inspector(config, mock_packages, request):
+    inspector_cls = request.param
+    if inspector_cls is NoStaticAnalysis:
+        return inspector_cls(configuration=config, repo=mock_packages)
+    return inspector_cls(
+        configuration=config,
+        repo=mock_packages,
+        store=spack.store.STORE,
+        binary_index=spack.binary_distribution.BINARY_INDEX,
     )
 
-    # only one mock MPI has a dependency
-    expected['fake'] = set()
 
-    assert expected == spack.package.possible_dependencies(
-        "mpi", transitive=False)
-
-
-def test_possible_dependencies_missing(mock_packages):
-    md = spack.repo.get("missing-dependency")
-    missing = {}
-    md.possible_dependencies(transitive=True, missing=missing)
-    assert set([
-        "this-is-a-missing-dependency"
-    ]) == missing["missing-dependency"]
+@pytest.fixture
+def mpi_names(mock_inspector):
+    return [spec.name for spec in mock_inspector.providers_for("mpi")]
 
 
-def test_possible_dependencies_with_deptypes(mock_packages):
-    dtbuild1 = spack.repo.get('dtbuild1')
+@pytest.mark.parametrize(
+    "pkg_name,fn_kwargs,expected",
+    [
+        (
+            "mpileaks",
+            {"expand_virtuals": True, "allowed_deps": dt.ALL},
+            {
+                "fake",
+                "mpileaks",
+                "gcc",
+                "llvm",
+                "compiler-with-deps",
+                "binutils-for-test",
+                "zlib",
+                "multi-provider-mpi",
+                "callpath",
+                "dyninst",
+                "mpich2",
+                "libdwarf",
+                "zmpi",
+                "low-priority-provider",
+                "intel-parallel-studio",
+                "mpich",
+                "libelf",
+            },
+        ),
+        (
+            "mpileaks",
+            {"expand_virtuals": False, "allowed_deps": dt.ALL},
+            {"callpath", "dyninst", "libdwarf", "libelf", "mpileaks"},
+        ),
+        (
+            "mpileaks",
+            {"expand_virtuals": False, "allowed_deps": dt.ALL, "transitive": False},
+            {"callpath", "mpileaks"},
+        ),
+        ("dtbuild1", {"allowed_deps": dt.LINK | dt.RUN}, {"dtbuild1", "dtrun2", "dtlink2"}),
+        ("dtbuild1", {"allowed_deps": dt.BUILD}, {"dtbuild1", "dtbuild2", "dtlink2"}),
+        ("dtbuild1", {"allowed_deps": dt.LINK}, {"dtbuild1", "dtlink2"}),
+    ],
+)
+def test_possible_dependencies(pkg_name, fn_kwargs, expected, mock_inspector):
+    """Tests possible nodes of mpileaks, under different scenarios."""
+    result, *_ = mock_inspector.possible_dependencies(pkg_name, **fn_kwargs)
+    assert expected == result
 
-    assert {
-        'dtbuild1': set(['dtrun2', 'dtlink2']),
-        'dtlink2': set(),
-        'dtrun2': set(),
-    } == dtbuild1.possible_dependencies(deptype=('link', 'run'))
 
-    assert {
-        'dtbuild1': set(['dtbuild2', 'dtlink2']),
-        'dtbuild2': set(),
-        'dtlink2': set(),
-    } == dtbuild1.possible_dependencies(deptype=('build'))
+def test_possible_dependencies_virtual(mock_inspector, mock_packages, mpi_names):
+    expected = set(mpi_names)
+    for name in mpi_names:
+        expected.update(
+            dep
+            for dep in mock_packages.get_pkg_class(name).dependencies_by_name()
+            if not mock_packages.is_virtual(dep)
+        )
+    expected.update(s.name for s in mock_packages.providers_for("c"))
 
-    assert {
-        'dtbuild1': set(['dtlink2']),
-        'dtlink2': set(),
-    } == dtbuild1.possible_dependencies(deptype=('link'))
+    real_pkgs, *_ = mock_inspector.possible_dependencies(
+        "mpi", transitive=False, allowed_deps=dt.ALL
+    )
+    assert expected == real_pkgs
+
+
+def test_possible_dependencies_missing(mock_inspector):
+    result, *_ = mock_inspector.possible_dependencies("missing-dependency", allowed_deps=dt.ALL)
+    assert "this-is-a-missing-dependency" not in result
 
 
 def test_possible_dependencies_with_multiple_classes(
-        mock_packages, mpileaks_possible_deps):
-    pkgs = ['dt-diamond', 'mpileaks']
-    expected = mpileaks_possible_deps.copy()
-    expected.update({
-        'dt-diamond': set(['dt-diamond-left', 'dt-diamond-right']),
-        'dt-diamond-left': set(['dt-diamond-bottom']),
-        'dt-diamond-right': set(['dt-diamond-bottom']),
-        'dt-diamond-bottom': set(),
-    })
+    mock_inspector, mock_packages, mpileaks_possible_deps
+):
+    pkgs = ["dt-diamond", "mpileaks"]
+    expected = set(mpileaks_possible_deps)
+    expected.update({"dt-diamond", "dt-diamond-left", "dt-diamond-right", "dt-diamond-bottom"})
 
-    assert expected == spack.package.possible_dependencies(*pkgs)
+    real_pkgs, *_ = mock_inspector.possible_dependencies(*pkgs, allowed_deps=dt.ALL)
+    assert set(expected) == real_pkgs
 
 
-def setup_install_test(source_paths, install_test_root):
+def setup_install_test(source_paths, test_root):
     """
     Set up the install test by creating sources and install test roots.
 
     The convention used here is to create an empty file if the path name
     ends with an extension otherwise, a directory is created.
     """
-    fs.mkdirp(install_test_root)
+    fs.mkdirp(test_root)
     for path in source_paths:
         if os.path.splitext(path)[1]:
             fs.touchp(path)
@@ -143,55 +172,249 @@ def setup_install_test(source_paths, install_test_root):
             fs.mkdirp(path)
 
 
-@pytest.mark.parametrize('spec,sources,extras,expect', [
-    ('a',
-     ['example/a.c'],   # Source(s)
-     ['example/a.c'],   # Extra test source
-     ['example/a.c']),  # Test install dir source(s)
-    ('b',
-     ['test/b.cpp', 'test/b.hpp', 'example/b.txt'],   # Source(s)
-     ['test'],                                        # Extra test source
-     ['test/b.cpp', 'test/b.hpp']),                   # Test install dir source
-    ('c',
-     ['examples/a.py', 'examples/b.py', 'examples/c.py', 'tests/d.py'],
-     ['examples/b.py', 'tests'],
-     ['examples/b.py', 'tests/d.py']),
-])
+@pytest.mark.parametrize(
+    "spec,sources,extras,expect",
+    [
+        (
+            "pkg-a",
+            ["example/a.c"],  # Source(s)
+            ["example/a.c"],  # Extra test source
+            ["example/a.c"],
+        ),  # Test install dir source(s)
+        (
+            "pkg-b",
+            ["test/b.cpp", "test/b.hpp", "example/b.txt"],  # Source(s)
+            ["test"],  # Extra test source
+            ["test/b.cpp", "test/b.hpp"],
+        ),  # Test install dir source
+        (
+            "pkg-c",
+            ["examples/a.py", "examples/b.py", "examples/c.py", "tests/d.py"],
+            ["examples/b.py", "tests"],
+            ["examples/b.py", "tests/d.py"],
+        ),
+    ],
+)
 def test_cache_extra_sources(install_mockery, spec, sources, extras, expect):
     """Test the package's cache extra test sources helper function."""
+    s = spack.concretize.concretize_one(spec)
 
-    pkg = spack.repo.get(spec)
-    pkg.spec.concretize()
-    source_path = pkg.stage.source_path
+    source_path = s.package.stage.source_path
+    srcs = [fs.join_path(source_path, src) for src in sources]
+    test_root = spack.install_test.install_test_root(s.package)
+    setup_install_test(srcs, test_root)
 
-    srcs = [fs.join_path(source_path, s) for s in sources]
-    setup_install_test(srcs, pkg.install_test_root)
-
-    emsg_dir = 'Expected {0} to be a directory'
-    emsg_file = 'Expected {0} to be a file'
-    for s in srcs:
-        assert os.path.exists(s), 'Expected {0} to exist'.format(s)
-        if os.path.splitext(s)[1]:
-            assert os.path.isfile(s), emsg_file.format(s)
+    emsg_dir = "Expected {0} to be a directory"
+    emsg_file = "Expected {0} to be a file"
+    for src in srcs:
+        assert os.path.exists(src), "Expected {0} to exist".format(src)
+        if os.path.splitext(src)[1]:
+            assert os.path.isfile(src), emsg_file.format(src)
         else:
-            assert os.path.isdir(s), emsg_dir.format(s)
+            assert os.path.isdir(src), emsg_dir.format(src)
 
-    pkg.cache_extra_test_sources(extras)
+    spack.install_test.cache_extra_test_sources(s.package, extras)
 
-    src_dests = [fs.join_path(pkg.install_test_root, s) for s in sources]
-    exp_dests = [fs.join_path(pkg.install_test_root, e) for e in expect]
+    src_dests = [fs.join_path(test_root, src) for src in sources]
+    exp_dests = [fs.join_path(test_root, e) for e in expect]
     poss_dests = set(src_dests) | set(exp_dests)
 
-    msg = 'Expected {0} to{1} exist'
+    msg = "Expected {0} to{1} exist"
     for pd in poss_dests:
         if pd in exp_dests:
-            assert os.path.exists(pd), msg.format(pd, '')
+            assert os.path.exists(pd), msg.format(pd, "")
             if os.path.splitext(pd)[1]:
                 assert os.path.isfile(pd), emsg_file.format(pd)
             else:
                 assert os.path.isdir(pd), emsg_dir.format(pd)
         else:
-            assert not os.path.exists(pd), msg.format(pd, ' not')
+            assert not os.path.exists(pd), msg.format(pd, " not")
 
     # Perform a little cleanup
     shutil.rmtree(os.path.dirname(source_path))
+
+
+def test_cache_extra_sources_fails(install_mockery, tmp_path: pathlib.Path):
+    s = spack.concretize.concretize_one("pkg-a")
+
+    with pytest.raises(InstallError) as exc_info:
+        spack.install_test.cache_extra_test_sources(s.package, [str(tmp_path), "no-such-file"])
+
+    errors = str(exc_info.value)
+    assert f"'{tmp_path}') must be relative" in errors
+    assert "'no-such-file') for the copy does not exist" in errors
+
+
+def test_package_exes_and_libs():
+    with pytest.raises(spack.error.SpackError, match="defines both"):
+
+        class BadDetectablePackage(PackageBase):
+            executables = ["findme"]
+            libraries = ["libFindMe.a"]
+
+
+def test_package_url_and_urls():
+    UrlsPackage = type(
+        "URLsPackage",
+        (PackageBase,),
+        {
+            "__module__": "spack.pkg.builtin.urls_package",
+            "url": "https://www.example.com/url-package-1.0.tgz",
+            "urls": ["https://www.example.com/archive"],
+        },
+    )
+
+    s = spack.spec.Spec("urls-package")
+    with pytest.raises(ValueError, match="defines both"):
+        UrlsPackage(s)
+
+
+def test_package_license():
+    LicensedPackage = type(
+        "LicensedPackage", (PackageBase,), {"__module__": "spack.pkg.builtin.licensed_package"}
+    )
+
+    pkg = LicensedPackage(spack.spec.Spec("licensed-package"))
+    assert pkg.global_license_file is None
+
+    pkg.license_files = ["license.txt"]
+    assert os.path.basename(pkg.global_license_file) == pkg.license_files[0]
+
+
+class BaseTestPackage(PackageBase):
+    extendees = {}  # currently a required attribute for is_extension()
+
+
+def test_package_version_fails():
+    s = spack.spec.Spec("pkg-a")
+    pkg = BaseTestPackage(s)
+    with pytest.raises(ValueError, match="does not have a concrete version"):
+        pkg.version()
+
+
+def test_package_tester_fails():
+    s = spack.spec.Spec("pkg-a")
+    pkg = BaseTestPackage(s)
+    with pytest.raises(ValueError, match="without concrete version"):
+        pkg.tester()
+
+
+def test_package_fetcher_fails():
+    s = spack.spec.Spec("pkg-a")
+    pkg = BaseTestPackage(s)
+    with pytest.raises(ValueError, match="without concrete version"):
+        pkg.fetcher
+
+
+def test_package_test_no_compilers(mock_packages, monkeypatch, capfd):
+    """Ensures that a test which needs the compiler, and build dependencies, to run, is skipped
+    if no compiler is available.
+    """
+    s = spack.spec.Spec("pkg-a")
+    pkg = BaseTestPackage(s)
+    pkg.test_requires_compiler = True
+    pkg.do_test()
+    error = capfd.readouterr()[1]
+    assert "Skipping tests for package" in error
+
+
+def test_package_subscript(config, mock_packages):
+    """Tests that we can use the subscript notation on packages, and that it returns a package"""
+    root = spack.concretize.concretize_one("mpileaks")
+    root_pkg = root.package
+
+    # Subscript of a virtual
+    assert isinstance(root_pkg["mpi"], spack.package_base.PackageBase)
+
+    # Subscript on concrete
+    for d in root.traverse():
+        assert isinstance(root_pkg[d.name], spack.package_base.PackageBase)
+
+
+def test_deserialize_preserves_package_attribute(config, mock_packages):
+    x = spack.concretize.concretize_one("mpileaks").package
+    assert x.spec._package is x
+
+    y = spack.subprocess_context.deserialize(spack.subprocess_context.serialize(x))
+    assert y.spec._package is y
+
+
+@pytest.mark.require_provenance
+def test_git_provenance_commit_version(config, mock_packages):
+    spec = spack.concretize.concretize_one("git-ref-package@stable")
+    assert spec.satisfies(f"commit={'c' * 40}")
+
+
+@pytest.mark.parametrize("version", ("main", "tag", "annotated-tag"))
+@pytest.mark.parametrize("pre_stage", (True, False))
+@pytest.mark.require_provenance
+@pytest.mark.disable_clean_stage_check
+def test_git_provenance_find_commit_ls_remote(
+    git, mock_git_repository, mock_packages, config, monkeypatch, version, pre_stage
+):
+    repo_path = mock_git_repository.path
+    monkeypatch.setattr(
+        spack.package_base.PackageBase, "git", f"file://{repo_path}", raising=False
+    )
+
+    spec_str = f"git-test-commit@{version}"
+
+    if pre_stage:
+        spack.concretize.concretize_one(spec_str).package.do_stage(False)
+    else:
+        # explicitly disable ability to use stage or mirror, force url path
+        monkeypatch.setattr(
+            spack.package_base.PackageBase, "do_fetch", lambda *args, **kwargs: None
+        )
+
+    spec = spack.concretize.concretize_one(spec_str)
+
+    if pre_stage:
+        # confirmation that we actually had an expanded stage to query with ls-remote
+        assert spec.package.stage.expanded
+
+    vattrs = spec.package.versions[spec.version]
+    git_ref = vattrs.get("tag") or vattrs.get("branch")
+    # add the ^{} suffix to the ref so it redirects to the first parent git object
+    # for branches and lightweight tags the suffix makes no difference since it is
+    # always a commit SHA, but for annotated tags the SHA shifts from the tag SHA
+    # back to the commit SHA, which is what we want
+    actual_commit = git(
+        "-C", repo_path, "rev-parse", f"{git_ref}^{{}}", output=str, error=str
+    ).strip()
+    assert spec.variants["commit"].value == actual_commit
+
+
+@pytest.mark.require_provenance
+@pytest.mark.disable_clean_stage_check
+def test_git_provenance_cant_resolve_commit(
+    mock_packages: RepoPath, monkeypatch, config, capfd, tmp_path
+):
+    """Fail all attempts to resolve git commits"""
+    repo_path = str(tmp_path / "non_existent")
+    # patch the base class for dependencies, and the concrete class, whose own ``git``
+    # attribute (a real github URL) shadows the base class one
+    monkeypatch.setattr(spack.package_base.PackageBase, "git", repo_path, raising=False)
+    monkeypatch.setattr(mock_packages.get_pkg_class("git-ref-package"), "git", repo_path)
+    monkeypatch.setattr(spack.package_base.PackageBase, "do_fetch", lambda *args, **kwargs: None)
+    spec = spack.concretize.concretize_one("git-ref-package@develop")
+    captured = capfd.readouterr()
+    assert "commit" not in spec.variants
+    assert "Warning: Unable to resolve the git commit" in captured.err
+
+
+@pytest.mark.parametrize(
+    "pkg_name,preferred_version",
+    [
+        # This package has a deprecated v1.1.0 which should not be the preferred
+        ("deprecated-versions", "1.0.0"),
+        # Python has v2.7.11 marked as preferred and newer v3 versions
+        ("python", "2.7.11"),
+        # This package has various versions, some deprecated, plus "main" and "develop"
+        ("git-ref-package", "3.0.1"),
+    ],
+)
+def test_package_preferred_version(mock_packages, config, pkg_name, preferred_version):
+    """Tests retrieving the preferred version of a package."""
+    pkg_cls = mock_packages.get_pkg_class(pkg_name)
+    assert spack.package_base.preferred_version(pkg_cls) == Version(preferred_version)

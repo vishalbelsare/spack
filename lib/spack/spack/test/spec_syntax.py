@@ -1,834 +1,2226 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import itertools
 import os
-import shlex
+import pathlib
+import re
+import sys
 
 import pytest
 
-import llnl.util.filesystem as fs
-
-import spack.hash_types as ht
+import spack.binary_distribution
+import spack.cmd
+import spack.concretize
+import spack.deptypes
+import spack.error
+import spack.hash_lookup
+import spack.platforms.test
 import spack.repo
-import spack.spec as sp
-import spack.store
-from spack.parse import Token
-from spack.spec import (
-    AmbiguousHashError,
-    DuplicateArchitectureError,
-    DuplicateCompilerSpecError,
-    DuplicateDependencyError,
-    InvalidHashError,
-    MultipleVersionError,
-    NoSuchHashError,
-    NoSuchSpecFileError,
-    RedundantSpecError,
-    Spec,
-    SpecFilenameError,
-    SpecParseError,
+import spack.solver.asp
+import spack.spec
+import spack.util.filesystem as fs
+import spack.version
+from spack.externals import (
+    ExternalSpecsParser,
+    complete_variants_and_architecture,
+    extract_dicts_from_configuration,
 )
-from spack.variant import DuplicateVariantError
+from spack.spec import EMPTY_SPEC, Spec, expand_toolchains
+from spack.spec_parser import (
+    UNIX_FILENAME,
+    WINDOWS_FILENAME,
+    SpecParser,
+    SpecParsingError,
+    SpecTokenizationError,
+    parse_one_or_raise,
+)
 
-# Sample output for a complex lexing.
-complex_lex = [Token(sp.ID, 'mvapich_foo'),
-               Token(sp.DEP),
-               Token(sp.ID, '_openmpi'),
-               Token(sp.AT),
-               Token(sp.ID, '1.2'),
-               Token(sp.COLON),
-               Token(sp.ID, '1.4'),
-               Token(sp.COMMA),
-               Token(sp.ID, '1.6'),
-               Token(sp.PCT),
-               Token(sp.ID, 'intel'),
-               Token(sp.AT),
-               Token(sp.ID, '12.1'),
-               Token(sp.COLON),
-               Token(sp.ID, '12.6'),
-               Token(sp.ON),
-               Token(sp.ID, 'debug'),
-               Token(sp.OFF),
-               Token(sp.ID, 'qt_4'),
-               Token(sp.DEP),
-               Token(sp.ID, 'stackwalker'),
-               Token(sp.AT),
-               Token(sp.ID, '8.1_1e')]
+SKIP_ON_WINDOWS = pytest.mark.skipif(sys.platform == "win32", reason="Unix style path on Windows")
 
-# Another sample lexer output with a kv pair.
-kv_lex = [Token(sp.ID, 'mvapich_foo'),
-          Token(sp.ID, 'debug'),
-          Token(sp.EQ),
-          Token(sp.VAL, '4'),
-          Token(sp.DEP),
-          Token(sp.ID, '_openmpi'),
-          Token(sp.AT),
-          Token(sp.ID, '1.2'),
-          Token(sp.COLON),
-          Token(sp.ID, '1.4'),
-          Token(sp.COMMA),
-          Token(sp.ID, '1.6'),
-          Token(sp.PCT),
-          Token(sp.ID, 'intel'),
-          Token(sp.AT),
-          Token(sp.ID, '12.1'),
-          Token(sp.COLON),
-          Token(sp.ID, '12.6'),
-          Token(sp.ON),
-          Token(sp.ID, 'debug'),
-          Token(sp.OFF),
-          Token(sp.ID, 'qt_4'),
-          Token(sp.DEP),
-          Token(sp.ID, 'stackwalker'),
-          Token(sp.AT),
-          Token(sp.ID, '8.1_1e')]
+SKIP_ON_UNIX = pytest.mark.skipif(sys.platform != "win32", reason="Windows style path on Unix")
 
 
-class TestSpecSyntax(object):
-    # ========================================================================
-    # Parse checks
-    # ========================================================================
+def Token(kind, value, **kwargs):
+    return (kind, value, dict(kwargs))
 
-    def check_parse(self, expected, spec=None):
-        """Assert that the provided spec is able to be parsed.
 
-           If this is called with one argument, it assumes that the
-           string is canonical (i.e., no spaces and ~ instead of - for
-           variants) and that it will convert back to the string it came
-           from.
+def simple_package_name(name):
+    """A simple package name in canonical form"""
+    return name, [Token("UNQUALIFIED_PACKAGE_NAME", value=name)], name
 
-           If this is called with two arguments, the first argument is
-           the expected canonical form and the second is a non-canonical
-           input to be parsed.
 
-        """
-        if spec is None:
-            spec = expected
-        output = sp.parse(spec)
+def dependency_with_version(text):
+    root, rest = text.split("^")
+    dependency, version = rest.split("@")
+    return (
+        text,
+        [
+            Token("UNQUALIFIED_PACKAGE_NAME", value=root.strip()),
+            Token("DEPENDENCY", value="^"),
+            Token("UNQUALIFIED_PACKAGE_NAME", value=dependency.strip()),
+            Token("VERSION", value=f"@{version}"),
+        ],
+        text,
+    )
 
-        parsed = (" ".join(str(spec) for spec in output))
-        assert expected == parsed
 
-    def check_lex(self, tokens, spec):
-        """Check that the provided spec parses to the provided token list."""
-        spec = shlex.split(str(spec))
-        lex_output = sp.SpecLexer().lex(spec)
-        assert len(tokens) == len(lex_output), "unexpected number of tokens"
-        for tok, spec_tok in zip(tokens, lex_output):
-            if tok.type == sp.ID or tok.type == sp.VAL:
-                assert tok == spec_tok
+@pytest.fixture()
+def specfile_for(config, mock_packages):
+    def _specfile_for(spec_str, filename):
+        s = spack.concretize.concretize_one(spec_str)
+        is_json = str(filename).endswith(".json")
+        is_yaml = str(filename).endswith(".yaml")
+        if not is_json and not is_yaml:
+            raise ValueError("wrong extension used for specfile")
+
+        with filename.open("w") as f:
+            if is_json:
+                f.write(s.to_json())
             else:
-                # Only check the type for non-identifiers.
-                assert tok.type == spec_tok.type
+                f.write(s.to_yaml())
+        return s
 
-    def _check_raises(self, exc_type, items):
-        for item in items:
-            with pytest.raises(exc_type):
-                print("CHECKING: ", item, "=======================")
-                Spec(item)
+    return _specfile_for
 
-    # ========================================================================
-    # Parse checks
-    # ========================================================================
-    def test_package_names(self):
-        self.check_parse("mvapich")
-        self.check_parse("mvapich_foo")
-        self.check_parse("_mvapich_foo")
 
-    def test_anonymous_specs(self):
-        self.check_parse("%intel")
-        self.check_parse("@2.7")
-        self.check_parse("^zlib")
-        self.check_parse("+foo")
-        self.check_parse("arch=test-None-None", "platform=test")
-        self.check_parse('@2.7:')
-
-    def test_anonymous_specs_with_multiple_parts(self):
-        # Parse anonymous spec with multiple tokens
-        self.check_parse('@4.2: languages=go', 'languages=go @4.2:')
-        self.check_parse('@4.2: languages=go')
-
-    def test_simple_dependence(self):
-        self.check_parse("openmpi ^hwloc")
-        self.check_parse("openmpi ^hwloc", "openmpi^hwloc")
-
-        self.check_parse("openmpi ^hwloc ^libunwind")
-        self.check_parse("openmpi ^hwloc ^libunwind",
-                         "openmpi^hwloc^libunwind")
-
-    def test_version_after_compiler(self):
-        self.check_parse('foo@2.0%bar@1.0', 'foo %bar@1.0 @2.0')
-
-    def test_dependencies_with_versions(self):
-        self.check_parse("openmpi ^hwloc@1.2e6")
-        self.check_parse("openmpi ^hwloc@1.2e6:")
-        self.check_parse("openmpi ^hwloc@:1.4b7-rc3")
-        self.check_parse("openmpi ^hwloc@1.2e6:1.4b7-rc3")
-
-    def test_multiple_specs(self):
-        self.check_parse("mvapich emacs")
-
-    def test_multiple_specs_after_kv(self):
-        self.check_parse('mvapich cppflags="-O3 -fPIC" emacs')
-        self.check_parse('mvapich cflags="-O3" emacs',
-                         'mvapich cflags=-O3 emacs')
-
-    def test_multiple_specs_long_second(self):
-        self.check_parse('mvapich emacs@1.1.1%intel cflags="-O3"',
-                         'mvapich emacs @1.1.1 %intel cflags=-O3')
-        self.check_parse('mvapich cflags="-O3 -fPIC" emacs ^ncurses%intel')
-        self.check_parse('mvapich cflags="-O3 -fPIC" emacs ^ncurses%intel',
-                         'mvapich cflags="-O3 -fPIC" emacs^ncurses%intel')
-
-    def test_full_specs(self):
-        self.check_parse(
-            "mvapich_foo"
-            " ^_openmpi@1.2:1.4,1.6%intel@12.1+debug~qt_4"
-            " ^stackwalker@8.1_1e")
-        self.check_parse(
-            "mvapich_foo"
-            " ^_openmpi@1.2:1.4,1.6%intel@12.1~qt_4 debug=2"
-            " ^stackwalker@8.1_1e")
-        self.check_parse(
-            'mvapich_foo'
-            ' ^_openmpi@1.2:1.4,1.6%intel@12.1 cppflags="-O3" +debug~qt_4'
-            ' ^stackwalker@8.1_1e')
-        self.check_parse(
-            "mvapich_foo"
-            " ^_openmpi@1.2:1.4,1.6%intel@12.1~qt_4 debug=2"
-            " ^stackwalker@8.1_1e arch=test-redhat6-x86")
-
-    def test_yaml_specs(self):
-        self.check_parse(
-            "yaml-cpp@0.1.8%intel@12.1"
-            " ^boost@3.1.4")
-        tempspec = r"builtin.yaml-cpp%gcc"
-        self.check_parse(
-            tempspec.strip("builtin."),
-            spec=tempspec)
-        tempspec = r"testrepo.yaml-cpp%gcc"
-        self.check_parse(
-            tempspec.strip("testrepo."),
-            spec=tempspec)
-        tempspec = r"builtin.yaml-cpp@0.1.8%gcc"
-        self.check_parse(
-            tempspec.strip("builtin."),
-            spec=tempspec)
-        tempspec = r"builtin.yaml-cpp@0.1.8%gcc@7.2.0"
-        self.check_parse(
-            tempspec.strip("builtin."),
-            spec=tempspec)
-        tempspec = r"builtin.yaml-cpp@0.1.8%gcc@7.2.0" \
-            r" ^boost@3.1.4"
-        self.check_parse(
-            tempspec.strip("builtin."),
-            spec=tempspec)
-
-    def test_canonicalize(self):
-        self.check_parse(
-            "mvapich_foo"
-            " ^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug~qt_4"
+@pytest.mark.parametrize(
+    "spec_str,tokens,expected_roundtrip",
+    [
+        # Package names
+        simple_package_name("mvapich"),
+        simple_package_name("mvapich_foo"),
+        simple_package_name("_mvapich_foo"),
+        simple_package_name("3dtk"),
+        simple_package_name("ns-3-dev"),
+        # Single token anonymous specs
+        ("@2.7", [Token("VERSION", value="@2.7")], "@2.7"),
+        ("@2.7:", [Token("VERSION", value="@2.7:")], "@2.7:"),
+        ("@:2.7", [Token("VERSION", value="@:2.7")], "@:2.7"),
+        ("+foo", [Token("BOOL_VARIANT", value="+foo")], "+foo"),
+        ("~foo", [Token("BOOL_VARIANT", value="~foo")], "~foo"),
+        ("-foo", [Token("BOOL_VARIANT", value="-foo")], "~foo"),
+        ("platform=test", [Token("KEY_VALUE_PAIR", value="platform=test")], "platform=test"),
+        # Multiple tokens anonymous specs
+        (
+            "%intel",
+            [Token("DEPENDENCY", value="%"), Token("UNQUALIFIED_PACKAGE_NAME", "intel")],
+            "%intel",
+        ),
+        (
+            "languages=go @4.2:",
+            [Token("KEY_VALUE_PAIR", value="languages=go"), Token("VERSION", value="@4.2:")],
+            "@4.2: languages=go",
+        ),
+        (
+            "@4.2:     languages=go",
+            [Token("VERSION", value="@4.2:"), Token("KEY_VALUE_PAIR", value="languages=go")],
+            "@4.2: languages=go",
+        ),
+        (
+            "^zlib",
+            [Token("DEPENDENCY", value="^"), Token("UNQUALIFIED_PACKAGE_NAME", value="zlib")],
+            "^zlib",
+        ),
+        # Specs with simple dependencies
+        (
+            "openmpi ^hwloc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="openmpi"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="hwloc"),
+            ],
+            "openmpi ^hwloc",
+        ),
+        (
+            "openmpi ^hwloc ^libunwind",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="openmpi"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="hwloc"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="libunwind"),
+            ],
+            "openmpi ^hwloc ^libunwind",
+        ),
+        (
+            "openmpi      ^hwloc^libunwind",
+            [  # White spaces are tested
+                Token("UNQUALIFIED_PACKAGE_NAME", value="openmpi"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="hwloc"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="libunwind"),
+            ],
+            "openmpi ^hwloc ^libunwind",
+        ),
+        # Version after compiler
+        (
+            "foo @2.0 %bar@1.0",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="foo"),
+                Token("VERSION", value="@2.0"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="bar"),
+                Token("VERSION", value="@1.0"),
+            ],
+            "foo@2.0 %bar@1.0",
+        ),
+        # Single dependency with version
+        dependency_with_version("openmpi ^hwloc@1.2e6"),
+        dependency_with_version("openmpi ^hwloc@1.2e6:"),
+        dependency_with_version("openmpi ^hwloc@:1.4b7-rc3"),
+        dependency_with_version("openmpi ^hwloc@1.2e6:1.4b7-rc3"),
+        # Complex specs with multiple constraints
+        (
+            "mvapich_foo ^_openmpi@1.2:1.4,1.6+debug~qt_4 %intel@12.1 ^stackwalker@8.1_1e",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich_foo"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+                Token("VERSION", value="@1.2:1.4,1.6"),
+                Token("BOOL_VARIANT", value="+debug"),
+                Token("BOOL_VARIANT", value="~qt_4"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+                Token("VERSION", value="@12.1"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="stackwalker"),
+                Token("VERSION", value="@8.1_1e"),
+            ],
+            "mvapich_foo ^_openmpi@1.2:1.4,1.6+debug~qt_4 %intel@12.1 ^stackwalker@8.1_1e",
+        ),
+        (
+            "mvapich_foo ^_openmpi@1.2:1.4,1.6~qt_4 debug=2 %intel@12.1 ^stackwalker@8.1_1e",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich_foo"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+                Token("VERSION", value="@1.2:1.4,1.6"),
+                Token("BOOL_VARIANT", value="~qt_4"),
+                Token("KEY_VALUE_PAIR", value="debug=2"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+                Token("VERSION", value="@12.1"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="stackwalker"),
+                Token("VERSION", value="@8.1_1e"),
+            ],
+            "mvapich_foo ^_openmpi@1.2:1.4,1.6~qt_4 debug=2 %intel@12.1 ^stackwalker@8.1_1e",
+        ),
+        (
+            "mvapich_foo ^_openmpi@1.2:1.4,1.6 cppflags=-O3 +debug~qt_4 %intel@12.1 "
+            "^stackwalker@8.1_1e",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich_foo"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+                Token("VERSION", value="@1.2:1.4,1.6"),
+                Token("KEY_VALUE_PAIR", value="cppflags=-O3"),
+                Token("BOOL_VARIANT", value="+debug"),
+                Token("BOOL_VARIANT", value="~qt_4"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+                Token("VERSION", value="@12.1"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="stackwalker"),
+                Token("VERSION", value="@8.1_1e"),
+            ],
+            "mvapich_foo ^_openmpi@1.2:1.4,1.6 cppflags=-O3 +debug~qt_4 %intel@12.1"
             " ^stackwalker@8.1_1e",
+        ),
+        # Specs containing YAML or JSON in the package name
+        (
+            "yaml-cpp@0.1.8%intel@12.1 ^boost@3.1.4",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="yaml-cpp"),
+                Token("VERSION", value="@0.1.8"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+                Token("VERSION", value="@12.1"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="boost"),
+                Token("VERSION", value="@3.1.4"),
+            ],
+            "yaml-cpp@0.1.8 %intel@12.1 ^boost@3.1.4",
+        ),
+        (
+            r"builtin.yaml-cpp%gcc",
+            [
+                Token("FULLY_QUALIFIED_PACKAGE_NAME", value="builtin.yaml-cpp"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+            ],
+            "builtin.yaml-cpp %gcc",
+        ),
+        (
+            r"testrepo.yaml-cpp%gcc",
+            [
+                Token("FULLY_QUALIFIED_PACKAGE_NAME", value="testrepo.yaml-cpp"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+            ],
+            "testrepo.yaml-cpp %gcc",
+        ),
+        (
+            r"builtin.yaml-cpp@0.1.8%gcc@7.2.0 ^boost@3.1.4",
+            [
+                Token("FULLY_QUALIFIED_PACKAGE_NAME", value="builtin.yaml-cpp"),
+                Token("VERSION", value="@0.1.8"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@7.2.0"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="boost"),
+                Token("VERSION", value="@3.1.4"),
+            ],
+            "builtin.yaml-cpp@0.1.8 %gcc@7.2.0 ^boost@3.1.4",
+        ),
+        (
+            r"builtin.yaml-cpp ^testrepo.boost ^zlib",
+            [
+                Token("FULLY_QUALIFIED_PACKAGE_NAME", value="builtin.yaml-cpp"),
+                Token("DEPENDENCY", value="^"),
+                Token("FULLY_QUALIFIED_PACKAGE_NAME", value="testrepo.boost"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+            ],
+            "builtin.yaml-cpp ^testrepo.boost ^zlib",
+        ),
+        # Canonicalization of the string representation
+        (
+            r"mvapich ^stackwalker ^_openmpi",  # Dependencies are reordered
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="stackwalker"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+            ],
+            "mvapich ^_openmpi ^stackwalker",
+        ),
+        (
+            r"y~f+e~d+c~b+a",  # Variants are reordered
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("BOOL_VARIANT", value="~f"),
+                Token("BOOL_VARIANT", value="+e"),
+                Token("BOOL_VARIANT", value="~d"),
+                Token("BOOL_VARIANT", value="+c"),
+                Token("BOOL_VARIANT", value="~b"),
+                Token("BOOL_VARIANT", value="+a"),
+            ],
+            "y+a~b+c~d+e~f",
+        ),
+        # Things that evaluate to Spec()
+        # TODO: consider making these format to "*" instead of ""
+        ("@:", [Token("VERSION", value="@:")], r""),
+        ("*", [Token("UNQUALIFIED_PACKAGE_NAME", value="*")], r""),
+        # anonymous dependencies with variants
+        (
+            "^* foo=bar",
+            [
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="*"),
+                Token("KEY_VALUE_PAIR", value="foo=bar"),
+            ],
+            "^* foo=bar",
+        ),
+        (
+            "%* foo=bar",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="*"),
+                Token("KEY_VALUE_PAIR", value="foo=bar"),
+            ],
+            "%* foo=bar",
+        ),
+        (
+            "^*+foo",
+            [
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="*"),
+                Token("BOOL_VARIANT", value="+foo"),
+            ],
+            "^+foo",
+        ),
+        (
+            "^*~foo",
+            [
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="*"),
+                Token("BOOL_VARIANT", value="~foo"),
+            ],
+            "^~foo",
+        ),
+        (
+            "%*+foo",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="*"),
+                Token("BOOL_VARIANT", value="+foo"),
+            ],
+            "%+foo",
+        ),
+        (
+            "%*~foo",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="*"),
+                Token("BOOL_VARIANT", value="~foo"),
+            ],
+            "%~foo",
+        ),
+        # version range and list
+        ("@1.6,1.2:1.4", [Token("VERSION", value="@1.6,1.2:1.4")], r"@1.2:1.4,1.6"),
+        (
+            r"os=default_os",  # Various translations associated with the architecture
+            [Token("KEY_VALUE_PAIR", value="os=default_os")],
+            "platform=test os=debian6",
+        ),
+        (
+            r"target=default_target",
+            [Token("KEY_VALUE_PAIR", value="target=default_target")],
+            f"platform=test target={spack.platforms.test.Test.default}",
+        ),
+        (r"platform=linux", [Token("KEY_VALUE_PAIR", value="platform=linux")], r"platform=linux"),
+        # Version hash pair
+        (
+            rf"develop-branch-version@{'abc12' * 8}=develop",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="develop-branch-version"),
+                Token(
+                    "VERSION",
+                    value=f"@{'abc12' * 8}=develop",
+                    version_list=f"{'abc12' * 8}=develop",
+                ),
+            ],
+            rf"develop-branch-version@{'abc12' * 8}=develop",
+        ),
+        # Redundant specs
+        (
+            r"x ^y@foo ^y@foo",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="x"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("VERSION", value="@foo"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("VERSION", value="@foo"),
+            ],
+            r"x ^y@foo",
+        ),
+        (
+            r"x ^y@foo ^y+bar",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="x"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("VERSION", value="@foo"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("BOOL_VARIANT", value="+bar"),
+            ],
+            r"x ^y+bar ^y@foo",
+        ),
+        (
+            r"x ^y@foo +bar ^y@foo",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="x"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("VERSION", value="@foo"),
+                Token("BOOL_VARIANT", value="+bar"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="y"),
+                Token("VERSION", value="@foo"),
+            ],
+            r"x ^y@foo+bar",
+        ),
+        # Ambiguous variant specification
+        (
+            r"_openmpi +debug-qt_4",  # Parse as a single bool variant
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+                Token("BOOL_VARIANT", value="+debug-qt_4"),
+            ],
+            r"_openmpi+debug-qt_4",
+        ),
+        (
+            r"_openmpi +debug -qt_4",  # Parse as two variants
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+                Token("BOOL_VARIANT", value="+debug"),
+                Token("BOOL_VARIANT", value="-qt_4"),
+            ],
+            r"_openmpi+debug~qt_4",
+        ),
+        (
+            r"_openmpi +debug~qt_4",  # Parse as two variants
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="_openmpi"),
+                Token("BOOL_VARIANT", value="+debug"),
+                Token("BOOL_VARIANT", value="~qt_4"),
+            ],
+            r"_openmpi+debug~qt_4",
+        ),
+        # Key value pairs with ":" and "," in the value
+        (
+            r"target=:broadwell,icelake",
+            [Token("KEY_VALUE_PAIR", value="target=:broadwell,icelake")],
+            r"target=:broadwell,icelake",
+        ),
+        # Hash pair version followed by a variant
+        (
+            f"develop-branch-version@git.{'a' * 40}=develop+var1+var2",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="develop-branch-version"),
+                Token(
+                    "VERSION",
+                    value=f"@git.{'a' * 40}=develop",
+                    version_list=f"git.{'a' * 40}=develop",
+                ),
+                Token("BOOL_VARIANT", value="+var1", bv_prefix="+", bv_name="var1"),
+                Token("BOOL_VARIANT", value="+var2", bv_prefix="+", bv_name="var2"),
+            ],
+            f"develop-branch-version@git.{'a' * 40}=develop+var1+var2",
+        ),
+        # Compiler with version ranges
+        (
+            "%gcc@10.2.1:",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@10.2.1:"),
+            ],
+            "%gcc@10.2.1:",
+        ),
+        (
+            "%gcc@:10.2.1",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@:10.2.1"),
+            ],
+            "%gcc@:10.2.1",
+        ),
+        (
+            "%gcc@10.2.1:12.1.0",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@10.2.1:12.1.0"),
+            ],
+            "%gcc@10.2.1:12.1.0",
+        ),
+        (
+            "%gcc@10.1.0,12.2.1:",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@10.1.0,12.2.1:"),
+            ],
+            "%gcc@10.1.0,12.2.1:",
+        ),
+        (
+            "%gcc@:8.4.3,10.2.1:12.1.0",
+            [
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@:8.4.3,10.2.1:12.1.0"),
+            ],
+            "%gcc@:8.4.3,10.2.1:12.1.0",
+        ),
+        # Special key value arguments
+        ("dev_path=*", [Token("KEY_VALUE_PAIR", value="dev_path=*")], "dev_path='*'"),
+        ("dev_path=none", [Token("KEY_VALUE_PAIR", value="dev_path=none")], "dev_path=none"),
+        (
+            "dev_path=../relpath/work",
+            [Token("KEY_VALUE_PAIR", value="dev_path=../relpath/work")],
+            "dev_path=../relpath/work",
+        ),
+        (
+            "dev_path=/abspath/work",
+            [Token("KEY_VALUE_PAIR", value="dev_path=/abspath/work")],
+            "dev_path=/abspath/work",
+        ),
+        # One liner for flags like 'a=b=c' that are injected
+        ("cflags=a=b=c", [Token("KEY_VALUE_PAIR", value="cflags=a=b=c")], "cflags='a=b=c'"),
+        ("cflags=a=b=c", [Token("KEY_VALUE_PAIR", value="cflags=a=b=c")], "cflags='a=b=c'"),
+        ("cflags=a=b=c+~", [Token("KEY_VALUE_PAIR", value="cflags=a=b=c+~")], "cflags='a=b=c+~'"),
+        (
+            "cflags=-Wl,a,b,c",
+            [Token("KEY_VALUE_PAIR", value="cflags=-Wl,a,b,c")],
+            "cflags=-Wl,a,b,c",
+        ),
+        # Multi quoted
+        (
+            'cflags=="-O3 -g"',
+            [
+                Token(
+                    "KEY_VALUE_PAIR",
+                    value='cflags=="-O3 -g"',
+                    kv_name="cflags",
+                    kv_sep="==",
+                    kv_value='"-O3 -g"',
+                )
+            ],
+            "cflags=='-O3 -g'",
+        ),
+        # Whitespace is allowed in version lists
+        ("@1.2:1.4 , 1.6 ", [Token("VERSION", value="@1.2:1.4 , 1.6")], "@1.2:1.4,1.6"),
+        # But not in ranges. `a@1:` and `b` are separate specs, not a single `a@1:b`.
+        (
+            "a@1: b",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="a"),
+                Token("VERSION", value="@1:"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="b"),
+            ],
+            "a@1:",
+        ),
+        (
+            "+ debug % intel @ 12.1:12.6",
+            [
+                Token("BOOL_VARIANT", value="+ debug"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+                Token("VERSION", value="@ 12.1:12.6"),
+            ],
+            "+debug %intel@12.1:12.6",
+        ),
+        (
+            "@ 12.1:12.6 + debug - qt_4",
+            [
+                Token("VERSION", value="@ 12.1:12.6"),
+                Token("BOOL_VARIANT", value="+ debug"),
+                Token("BOOL_VARIANT", value="- qt_4"),
+            ],
+            "@12.1:12.6+debug~qt_4",
+        ),
+        (
+            "@10.4.0:10,11.3.0:target=aarch64:",
+            [
+                Token("VERSION", value="@10.4.0:10,11.3.0:"),
+                Token("KEY_VALUE_PAIR", value="target=aarch64:"),
+            ],
+            "@10.4.0:10,11.3.0: target=aarch64:",
+        ),
+        (
+            "@:0.4 % nvhpc",
+            [
+                Token("VERSION", value="@:0.4"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="nvhpc"),
+            ],
+            "@:0.4 %nvhpc",
+        ),
+        (
+            "^[virtuals=mpi] openmpi",
+            [
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="virtuals=mpi"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="openmpi"),
+            ],
+            "^mpi=openmpi",
+        ),
+        (
+            "^mpi=openmpi",
+            [
+                Token(
+                    "DEPENDENCY",
+                    value="^mpi=openmpi",
+                    edge_virtuals="mpi",
+                    edge_substitute="openmpi",
+                )
+            ],
+            "^mpi=openmpi",
+        ),
+        # Neither edge is direct, and the virtuals they declare are different, so the two share
+        # no role and stay parallel, like the plain ^y@foo ^y+bar case above.
+        (
+            "^[virtuals=mpi] openmpi+foo ^[virtuals=lapack] openmpi+bar",
+            [
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="virtuals=mpi"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="openmpi"),
+                Token("BOOL_VARIANT", value="+foo"),
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="virtuals=lapack"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="openmpi"),
+                Token("BOOL_VARIANT", value="+bar"),
+            ],
+            "^lapack=openmpi+bar ^mpi=openmpi+foo",
+        ),
+        (
+            "^lapack,mpi=openmpi+foo+bar",
+            [
+                Token(
+                    "DEPENDENCY",
+                    value="^lapack,mpi=openmpi",
+                    edge_virtuals="lapack,mpi",
+                    edge_substitute="openmpi",
+                ),
+                Token("BOOL_VARIANT", value="+foo", bv_prefix="+", bv_name="foo"),
+                Token("BOOL_VARIANT", value="+bar", bv_prefix="+", bv_name="bar"),
+            ],
+            "^lapack,mpi=openmpi+bar+foo",
+        ),
+        (
+            "^[deptypes=link,build] zlib",
+            [
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="deptypes=link,build"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+            ],
+            "^[deptypes=build,link] zlib",
+        ),
+        # Indirect edges to one name are never one node on deptypes alone; a shared virtual, or
+        # being direct, is what fuses them. When neither depflag is a superset of the other, the
+        # edges stay parallel.
+        (
+            "^[deptypes=link] zlib ^[deptypes=build] zlib",
+            [
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="deptypes=link"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="deptypes=build"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+            ],
+            "^[deptypes=link] zlib ^[deptypes=build] zlib",
+        ),
+        # [build,link] already satisfies [link], so the second edge is redundant and is discarded.
+        (
+            "^[deptypes=build,link] zlib ^[deptypes=link] zlib",
+            [
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="deptypes=build,link"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+                Token("DEPENDENCY", value="^["),
+                Token("KEY_VALUE_PAIR", value="deptypes=link"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+            ],
+            "^[deptypes=build,link] zlib",
+        ),
+        # A bare duplicate ^pkg-b is redundant, on either side of the % edge.
+        (
+            "pkg-a ^pkg-b %pkg-c ^pkg-b",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-a"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-c"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+            ],
+            "pkg-a ^pkg-b %pkg-c",
+        ),
+        # A ^ dependency is merged only once its trailing % edges are parsed: the % edge
+        # survives on the merged node.
+        (
+            "pkg-a ^pkg-b ^pkg-b %pkg-c",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-a"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-c"),
+            ],
+            "pkg-a ^pkg-b %pkg-c",
+        ),
+        (
+            "pkg-a ^pkg-b ^pkg-b@1 %pkg-c",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-a"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("VERSION", value="@1"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-c"),
+            ],
+            "pkg-a ^pkg-b@1 %pkg-c",
+        ),
+        # With the % sub-dag included, neither ^pkg-b edge satisfies the other, so they
+        # stay parallel.
+        (
+            "pkg-a ^pkg-b@1 ^pkg-b %pkg-c",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-a"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("VERSION", value="@1"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-b"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="pkg-c"),
+            ],
+            "pkg-a ^pkg-b %pkg-c ^pkg-b@1",
+        ),
+        (
+            "git-test@git.foo/bar",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "git-test"),
+                Token("VERSION", "@git.foo/bar", version_list="git.foo/bar"),
+            ],
+            "git-test@git.foo/bar",
+        ),
+        # A git ref constrained to a range of versions
+        (
+            "git-test@git.foo/bar=1.2:1.3",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "git-test"),
+                Token("VERSION", "@git.foo/bar=1.2:1.3", version_list="git.foo/bar=1.2:1.3"),
+            ],
+            "git-test@git.foo/bar=1.2:1.3",
+        ),
+        # Git refs as elements of a version list, which is canonical
+        (
+            "git-test@git.main,1.2:1.3,git.foo=1:2,git.foo=3:4",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "git-test"),
+                Token(
+                    "VERSION",
+                    "@git.main,1.2:1.3,git.foo=1:2,git.foo=3:4",
+                    version_list="git.main,1.2:1.3,git.foo=1:2,git.foo=3:4",
+                ),
+            ],
+            "git-test@1.2:1.3,git.foo=1:4,git.main",
+        ),
+        (
+            "git-test@git.foo=:1.3 ^pkg-b@git.bar=1.2: +baz",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "git-test"),
+                Token("VERSION", "@git.foo=:1.3", version_list="git.foo=:1.3"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "pkg-b"),
+                Token("VERSION", "@git.bar=1.2:", version_list="git.bar=1.2:"),
+                Token("BOOL_VARIANT", "+baz", bv_prefix="+", bv_name="baz"),
+            ],
+            "git-test@git.foo=:1.3 ^pkg-b@git.bar=1.2:+baz",
+        ),
+        # Variant propagation
+        (
+            "zlib ++foo",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("BOOL_VARIANT", "++foo", bv_prefix="++", bv_name="foo"),
+            ],
+            "zlib++foo",
+        ),
+        (
+            "zlib ~~foo",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("BOOL_VARIANT", "~~foo", bv_prefix="~~", bv_name="foo"),
+            ],
+            "zlib~~foo",
+        ),
+        (
+            "zlib foo==bar",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("KEY_VALUE_PAIR", "foo==bar", kv_name="foo", kv_sep="==", kv_value="bar"),
+            ],
+            "zlib foo==bar",
+        ),
+        # Compilers specifying virtuals
+        (
+            "zlib %[virtuals=c] gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("DEPENDENCY", value="%["),
+                Token("KEY_VALUE_PAIR", value="virtuals=c"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+            ],
+            "zlib %c=gcc",
+        ),
+        (
+            "zlib %c=gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("DEPENDENCY", value="%c=gcc", edge_virtuals="c", edge_substitute="gcc"),
+            ],
+            "zlib %c=gcc",
+        ),
+        (
+            "zlib %[virtuals=c,cxx] gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("DEPENDENCY", value="%["),
+                Token("KEY_VALUE_PAIR", value="virtuals=c,cxx"),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+            ],
+            "zlib %c,cxx=gcc",
+        ),
+        (
+            "zlib %c,cxx=gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token(
+                    "DEPENDENCY", value="%c,cxx=gcc", edge_virtuals="c,cxx", edge_substitute="gcc"
+                ),
+            ],
+            "zlib %c,cxx=gcc",
+        ),
+        (
+            "zlib %[virtuals=c,cxx] gcc@14.1",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("DEPENDENCY", value="%[", edge_bracket="["),
+                Token(
+                    "KEY_VALUE_PAIR",
+                    value="virtuals=c,cxx",
+                    kv_name="virtuals",
+                    kv_sep="=",
+                    kv_value="c,cxx",
+                ),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@14.1", version_list="14.1"),
+            ],
+            "zlib %c,cxx=gcc@14.1",
+        ),
+        (
+            "zlib %c,cxx=gcc@14.1",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token(
+                    "DEPENDENCY", value="%c,cxx=gcc", edge_virtuals="c,cxx", edge_substitute="gcc"
+                ),
+                Token("VERSION", value="@14.1", version_list="14.1"),
+            ],
+            "zlib %c,cxx=gcc@14.1",
+        ),
+        (
+            "zlib %[virtuals=fortran] gcc@14.1 %[virtuals=c,cxx] clang",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token("DEPENDENCY", value="%[", edge_bracket="["),
+                Token(
+                    "KEY_VALUE_PAIR",
+                    value="virtuals=fortran",
+                    kv_name="virtuals",
+                    kv_sep="=",
+                    kv_value="fortran",
+                ),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("VERSION", value="@14.1", version_list="14.1"),
+                Token("DEPENDENCY", value="%[", edge_bracket="["),
+                Token(
+                    "KEY_VALUE_PAIR",
+                    value="virtuals=c,cxx",
+                    kv_name="virtuals",
+                    kv_sep="=",
+                    kv_value="c,cxx",
+                ),
+                Token("END_EDGE_PROPERTIES", value="]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="clang"),
+            ],
+            "zlib %fortran=gcc@14.1 %c,cxx=clang",
+        ),
+        (
+            "zlib %fortran=gcc@14.1 %c,cxx=clang",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "zlib"),
+                Token(
+                    "DEPENDENCY",
+                    value="%fortran=gcc",
+                    edge_virtuals="fortran",
+                    edge_substitute="gcc",
+                ),
+                Token("VERSION", value="@14.1", version_list="14.1"),
+                Token(
+                    "DEPENDENCY",
+                    value="%c,cxx=clang",
+                    edge_virtuals="c,cxx",
+                    edge_substitute="clang",
+                ),
+            ],
+            "zlib %fortran=gcc@14.1 %c,cxx=clang",
+        ),
+        # test := and :== syntax for key value pairs
+        (
+            "gcc languages:=c,c++",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+                Token("KEY_VALUE_PAIR", "languages:=c,c++"),
+            ],
+            "gcc languages:='c,c++'",
+        ),
+        (
+            "gcc languages:==c,c++",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+                Token(
+                    "KEY_VALUE_PAIR",
+                    "languages:==c,c++",
+                    kv_name="languages",
+                    kv_sep=":==",
+                    kv_value="c,c++",
+                ),
+            ],
+            "gcc languages:=='c,c++'",
+        ),
+        # test <variants> etc. after %
+        (
+            "mvapich %gcc languages:=c,c++ target=x86_64",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "mvapich"),
+                Token("DEPENDENCY", "%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+                Token("KEY_VALUE_PAIR", "languages:=c,c++"),
+                Token("KEY_VALUE_PAIR", "target=x86_64"),
+            ],
+            "mvapich %gcc languages:='c,c++' target=x86_64",
+        ),
+        # Test conditional dependencies
+        (
+            "foo ^[when='%c' virtuals=c] gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "^["),
+                Token("KEY_VALUE_PAIR", "when='%c'"),
+                Token("KEY_VALUE_PAIR", "virtuals=c"),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo ^[when=%c] c=gcc",
+        ),
+        (
+            "foo ^[when='%c' virtuals=c]gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "^["),
+                Token("KEY_VALUE_PAIR", "when='%c'"),
+                Token("KEY_VALUE_PAIR", "virtuals=c"),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo ^[when=%c] c=gcc",
+        ),
+        (
+            "foo ^[when=%c] c=gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "^[", edge_bracket="["),
+                Token("KEY_VALUE_PAIR", "when=%c", kv_name="when", kv_sep="=", kv_value="%c"),
+                Token(
+                    "END_EDGE_PROPERTIES",
+                    "] c=gcc",
+                    end_edge_virtuals="c",
+                    end_edge_substitute="gcc",
+                ),
+            ],
+            "foo ^[when=%c] c=gcc",
+        ),
+        # Test dependency propagation
+        (
+            "foo %%gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo %%gcc",
+        ),
+        (
+            "foo %%c,cxx=gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%%c,cxx=gcc", edge_virtuals="c,cxx", edge_substitute="gcc"),
+            ],
+            "foo %%c,cxx=gcc",
+        ),
+        (
+            "foo %%[when=%c] c=gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%%[", edge_bracket="["),
+                Token("KEY_VALUE_PAIR", "when=%c", kv_name="when", kv_sep="=", kv_value="%c"),
+                Token(
+                    "END_EDGE_PROPERTIES",
+                    "] c=gcc",
+                    end_edge_virtuals="c",
+                    end_edge_substitute="gcc",
+                ),
+            ],
+            "foo %%[when=%c] c=gcc",
+        ),
+        (
+            "foo %%[when='%c' virtuals=c] gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%%["),
+                Token("KEY_VALUE_PAIR", "when='%c'"),
+                Token("KEY_VALUE_PAIR", "virtuals=c"),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo %%[when=%c] c=gcc",
+        ),
+        # whitespace between edge properties and a virtual assignment
+        (
+            "foo ^[when=%c]   c,cxx=builtin.gcc@14+bar",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="foo"),
+                Token("DEPENDENCY", value="^[", edge_bracket="["),
+                Token("KEY_VALUE_PAIR", "when=%c", kv_name="when", kv_sep="=", kv_value="%c"),
+                Token(
+                    "END_EDGE_PROPERTIES",
+                    "]   c,cxx=builtin.gcc",
+                    end_edge_virtuals="c,cxx",
+                    end_edge_substitute="builtin.gcc",
+                ),
+                Token("VERSION", value="@14", version_list="14"),
+                Token("BOOL_VARIANT", value="+bar", bv_prefix="+", bv_name="bar"),
+            ],
+            "foo ^[when=%c] c,cxx=builtin.gcc@14+bar",
+        ),
+        # Multiple groups of edge properties: an unquoted when= extends to its closing bracket,
+        # and other edge properties can follow in a new group
+        (
+            "foo %[when=+a][virtuals=c]gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%[", edge_bracket="["),
+                Token("KEY_VALUE_PAIR", "when=+a", kv_name="when", kv_sep="=", kv_value="+a"),
+                Token("END_EDGE_PROPERTIES", "][", edge_reopen="["),
+                Token(
+                    "KEY_VALUE_PAIR", "virtuals=c", kv_name="virtuals", kv_sep="=", kv_value="c"
+                ),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo %[when=+a] c=gcc",
+        ),
+        (
+            "foo %[when=%baz target=x86_64][virtuals=c]gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%["),
+                Token("KEY_VALUE_PAIR", "when=%baz"),
+                Token("KEY_VALUE_PAIR", "target=x86_64"),
+                Token("END_EDGE_PROPERTIES", "]["),
+                Token("KEY_VALUE_PAIR", "virtuals=c"),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo %[when=%baz target=x86_64] c=gcc",
+        ),
+        # the same edge properties in the opposite group order
+        (
+            "foo %[virtuals=c][when=%baz target=x86_64]gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%["),
+                Token("KEY_VALUE_PAIR", "virtuals=c"),
+                Token("END_EDGE_PROPERTIES", "]["),
+                Token("KEY_VALUE_PAIR", "when=%baz"),
+                Token("KEY_VALUE_PAIR", "target=x86_64"),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "gcc"),
+            ],
+            "foo %[when=%baz target=x86_64] c=gcc",
+        ),
+        # whitespace between groups of edge properties
+        (
+            "foo ^[deptypes=link] [when=+mpi] mpich",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "^["),
+                Token("KEY_VALUE_PAIR", "deptypes=link"),
+                Token("END_EDGE_PROPERTIES", "] ["),
+                Token("KEY_VALUE_PAIR", "when=+mpi"),
+                Token("END_EDGE_PROPERTIES", "]"),
+                Token("UNQUALIFIED_PACKAGE_NAME", "mpich"),
+            ],
+            "foo ^[deptypes=link when=+mpi] mpich",
+        ),
+        # a second group of edge properties closed by a fused virtual assignment
+        (
+            "foo %[when=+a][deptypes=link] c=gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", "foo"),
+                Token("DEPENDENCY", "%["),
+                Token("KEY_VALUE_PAIR", "when=+a"),
+                Token("END_EDGE_PROPERTIES", "]["),
+                Token("KEY_VALUE_PAIR", "deptypes=link"),
+                Token("END_EDGE_PROPERTIES", "] c=gcc"),
+            ],
+            "foo %[deptypes=link when=+a] c=gcc",
+        ),
+    ],
+)
+def test_parse_single_spec(spec_str, tokens, expected_roundtrip, mock_git_test_package):
+    parser = SpecParser(spec_str, Spec)
+    has_detailed_tokens = any(t[2] for t in tokens)
+    assert tokens == parser.tokens(with_subgroups=has_detailed_tokens)
+    assert expected_roundtrip == str(parser.next_spec())
 
-            "mvapich_foo "
-            "^_openmpi@1.6,1.2:1.4%intel@12.1:12.6+debug~qt_4 "
-            "^stackwalker@8.1_1e")
 
-        self.check_parse(
-            "mvapich_foo"
-            " ^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug~qt_4"
-            " ^stackwalker@8.1_1e",
+@pytest.mark.parametrize(
+    "text,tokens,expected_specs",
+    [
+        (
+            "mvapich emacs",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="emacs"),
+            ],
+            ["mvapich", "emacs"],
+        ),
+        (
+            "mvapich cppflags='-O3 -fPIC' emacs",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("KEY_VALUE_PAIR", value="cppflags='-O3 -fPIC'"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="emacs"),
+            ],
+            ["mvapich cppflags='-O3 -fPIC'", "emacs"],
+        ),
+        (
+            "mvapich cppflags=-O3 emacs",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("KEY_VALUE_PAIR", value="cppflags=-O3"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="emacs"),
+            ],
+            ["mvapich cppflags=-O3", "emacs"],
+        ),
+        (
+            "mvapich emacs @1.1.1 cflags=-O3 %intel",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="emacs"),
+                Token("VERSION", value="@1.1.1"),
+                Token("KEY_VALUE_PAIR", value="cflags=-O3"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+            ],
+            ["mvapich", "emacs @1.1.1 cflags=-O3 %intel"],
+        ),
+        (
+            'mvapich cflags="-O3 -fPIC" emacs^ncurses%intel',
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("KEY_VALUE_PAIR", value='cflags="-O3 -fPIC"'),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="emacs"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="ncurses"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="intel"),
+            ],
+            ['mvapich cflags="-O3 -fPIC"', "emacs ^ncurses%intel"],
+        ),
+        (
+            "mvapich %gcc languages=c,c++ emacs ^ncurses%gcc languages:=c",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="mvapich"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("KEY_VALUE_PAIR", value="languages=c,c++"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="emacs"),
+                Token("DEPENDENCY", value="^"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="ncurses"),
+                Token("DEPENDENCY", value="%"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+                Token("KEY_VALUE_PAIR", value="languages:=c"),
+            ],
+            ["mvapich %gcc languages=c,c++", "emacs ^ncurses%gcc languages:=c"],
+        ),
+        (
+            "zlib %c=gcc gcc",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="zlib"),
+                Token("DEPENDENCY", value="%c=gcc"),
+                Token("UNQUALIFIED_PACKAGE_NAME", value="gcc"),
+            ],
+            ["zlib %c=gcc", "gcc"],
+        ),
+    ],
+)
+def test_parse_multiple_specs(text, tokens, expected_specs):
+    total_parser = SpecParser(text, Spec)
+    assert total_parser.tokens() == tokens
 
-            "mvapich_foo "
-            "^stackwalker@8.1_1e "
-            "^_openmpi@1.6,1.2:1.4%intel@12.1:12.6~qt_4+debug")
+    for single_spec_text in expected_specs:
+        single_spec_parser = SpecParser(single_spec_text, Spec)
+        assert str(total_parser.next_spec()) == str(single_spec_parser.next_spec())
 
-        self.check_parse(
-            "x ^y@1,2:3,4%intel@1,2,3,4+a~b+c~d+e~f",
-            "x ^y~f+e~d+c~b+a@4,2:3,1%intel@4,3,2,1")
 
-        self.check_parse(
-            "x arch=test-redhat6-None"
-            " ^y arch=test-None-core2"
-            " ^z arch=linux-None-None",
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        # Test that CLI-quoted flags/variant values are preserved
+        (["zlib", "cflags=-O3 -g", "+bar", "baz"], "zlib cflags='-O3 -g' +bar baz"),
+        # Test that CLI-quoted propagated flags/variant values are preserved
+        (["zlib", "cflags==-O3 -g", "+bar", "baz"], "zlib cflags=='-O3 -g' +bar baz"),
+        # An entire string passed on the CLI with embedded quotes also works
+        (["zlib cflags='-O3 -g' +bar baz"], "zlib cflags='-O3 -g' +bar baz"),
+        # Entire string *without* quoted flags splits -O3/-g (-g interpreted as a variant)
+        (["zlib cflags=-O3 -g +bar baz"], "zlib cflags=-O3 +bar~g baz"),
+        # If the entirety of "-O3 -g +bar baz" is quoted on the CLI, it's all taken as flags
+        (["zlib", "cflags=-O3 -g +bar baz"], "zlib cflags='-O3 -g +bar baz'"),
+        # If the string doesn't start with key=, it needs internal quotes for flags
+        (["zlib", " cflags=-O3 -g +bar baz"], "zlib cflags=-O3 +bar~g baz"),
+        # Internal quotes for quoted CLI args are considered part of *one* arg
+        (["zlib", 'cflags="-O3 -g" +bar baz'], """zlib cflags='"-O3 -g" +bar baz'"""),
+        # Use double quotes if internal single quotes are present
+        (["zlib", "cflags='-O3 -g' +bar baz"], '''zlib cflags="'-O3 -g' +bar baz"'''),
+        # There is no escaping: a value cannot contain both kinds of quotes
+        (["zlib", '''cflags='-O3 -g' "+bar baz"'''], spack.error.SpecSyntaxError),
+        # and a backslash is a character like any other: the compiler gets the define as typed
+        (["zlib", r"cflags=-DCHAR=\'x\'"], r'''zlib cflags="-DCHAR=\'x\'"'''),
+        # Ensure that empty strings are handled correctly on CLI
+        (["zlib", "ldflags=", "+pic"], "zlib+pic"),
+        # These flags are assumed to be quoted by the shell, but the space doesn't matter because
+        # flags are space-separated.
+        (["zlib", "ldflags= +pic"], "zlib ldflags='+pic'"),
+        (["ldflags= +pic"], "ldflags='+pic'"),
+        # If the name is not a flag name, the space is preserved verbatim, because variant values
+        # are comma-separated.
+        (["zlib", "foo= +pic"], "zlib foo=' +pic'"),
+        (["foo= +pic"], "foo=' +pic'"),
+        # You can ensure no quotes are added parse_specs() by starting your string with space,
+        # but you still need to quote empty strings properly.
+        ([" ldflags= +pic"], SpecTokenizationError),
+        ([" ldflags=", "+pic"], SpecTokenizationError),
+        ([" ldflags='' +pic"], "+pic"),
+        ([" ldflags=''", "+pic"], "+pic"),
+        # Ensure that empty strings are handled properly in quoted strings
+        (["zlib ldflags='' +pic"], "zlib+pic"),
+        # Ensure that $ORIGIN is handled correctly
+        (["zlib", "ldflags=-Wl,-rpath=$ORIGIN/_libs"], "zlib ldflags='-Wl,-rpath=$ORIGIN/_libs'"),
+        # A closing bracket ends the edge attribute list, it is never part of the value
+        (["mpileaks", "%[", "when=@1.0]", "gcc"], "mpileaks %[when=@1.0] gcc"),
+        # but a bracket that has its opening one in the value is part of the value
+        (["zlib", "cflags=-DFOO=[1]"], "zlib cflags='-DFOO=[1]'"),
+        (["zlib", "cflags=-DX=']'"], "zlib cflags=\"-DX=']'\""),
+        # what follows the closing bracket is the dependency, and not part of the value either
+        (["x", "%[virtuals=c", "deptypes=build]gcc@14"], "x %[deptypes=build] c=gcc@14"),
+        (
+            ["x", "%[virtuals=c", "when=+a]gcc", "^[virtuals=mpi", "when=~b]mpich"],
+            "x %[when=+a] c=gcc ^[when=~b] mpi=mpich",
+        ),
+        # a when= value is a spec, which is not quoted even if it starts with a non-value character
+        (["x", "%[virtuals=c", "when=@1.0", "+debug]", "gcc"], "x %[when=@1.0+debug] c=gcc"),
+        # a value that is still quoted is left alone, the user quoted the whole argument
+        (["x", "cflags=' a b'"], "x cflags='a b'"),
+        # the limit: a when= condition with a quoted value only tokenizes inside brackets, so as
+        # one argument it is quoted as a whole and its bracket ends up in the condition
+        (["x", "%[virtuals=c", "when=a=']']", "gcc"], SpecParsingError),
+        # a value that parses as it is stays unquoted: c=gcc@14 is a virtual assignment
+        (["mpileaks", "%[when=+x]", "c=gcc@14"], "mpileaks %[when=+x] c=gcc@14"),
+        # Ensure that passing escaped quotes on the CLI raises a tokenization error
+        (["zlib", '"-g', '-O2"'], SpecTokenizationError),
+    ],
+)
+def test_cli_spec_roundtrip(args, expected):
+    if isinstance(expected, type) and issubclass(expected, BaseException):
+        with pytest.raises(expected):
+            spack.cmd.parse_specs(args)
+        return
 
-            "x os=fe "
-            "^y target=be "
-            "^z platform=linux")
+    specs = spack.cmd.parse_specs(args)
+    output_string = " ".join(str(spec) for spec in specs)
+    assert expected == output_string
 
-        self.check_parse(
-            "x arch=test-debian6-core2"
-            " ^y arch=test-debian6-core2",
 
-            "x os=default_os target=default_target"
-            " ^y os=default_os target=default_target")
+@pytest.mark.parametrize(
+    ["spec_str", "toolchain", "expected_roundtrip"],
+    [
+        (
+            "foo%my_toolchain",
+            {"my_toolchain": "%[when='%c' virtuals=c]gcc"},
+            ["foo %[when=%c] c=gcc"],
+        ),
+        ("foo%my_toolchain", {"my_toolchain": "%[when=%c] c=gcc"}, ["foo %[when=%c] c=gcc"]),
+        (
+            "foo%my_toolchain",
+            {"my_toolchain": "+bar cflags=baz %[when='%c' virtuals=c]gcc"},
+            ["foo cflags=baz +bar %[when=%c] c=gcc"],
+        ),
+        (
+            "foo%my_toolchain",
+            {"my_toolchain": "+bar cflags=baz %[when=%c]c=gcc"},
+            ["foo cflags=baz +bar %[when=%c] c=gcc"],
+        ),
+        (
+            "foo%my_toolchain2",
+            {"my_toolchain2": "%[when='%c' virtuals=c]gcc %[when='+mpi' virtuals=mpi]mpich"},
+            ["foo %[when=%c] c=gcc %[when=+mpi] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain2",
+            {"my_toolchain2": "%[when=%c] c=gcc %[when=+mpi] mpi=mpich"},
+            ["foo %[when=%c] c=gcc %[when=+mpi] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain bar%my_toolchain2",
+            {
+                "my_toolchain": "%[when='%c' virtuals=c]gcc",
+                "my_toolchain2": "%[when='%c' virtuals=c]gcc %[when='+mpi' virtuals=mpi]mpich",
+            },
+            ["foo %[when=%c] c=gcc", "bar %[when=%c] c=gcc %[when=+mpi] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain bar%my_toolchain2",
+            {
+                "my_toolchain": "%[when=%c] c=gcc",
+                "my_toolchain2": "%[when=%c] c=gcc %[when=+mpi]mpi=mpich",
+            },
+            ["foo %[when=%c] c=gcc", "bar %[when=%c] c=gcc %[when=+mpi] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain2",
+            {
+                "my_toolchain2": [
+                    {"spec": "%[virtuals=c]gcc", "when": "%c"},
+                    {"spec": "%[virtuals=mpi]mpich", "when": "+mpi"},
+                ]
+            },
+            ["foo %[when=%c] c=gcc %[when=+mpi] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain2",
+            {
+                "my_toolchain2": [
+                    {"spec": "%c=gcc", "when": "%c"},
+                    {"spec": "%mpi=mpich", "when": "+mpi"},
+                ]
+            },
+            ["foo %[when=%c] c=gcc %[when=+mpi] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain2",
+            {"my_toolchain2": [{"spec": "%[virtuals=c]gcc %[virtuals=mpi]mpich", "when": "%c"}]},
+            ["foo %[when=%c] c=gcc %[when=%c] mpi=mpich"],
+        ),
+        (
+            "foo%my_toolchain2",
+            {"my_toolchain2": [{"spec": "%c=gcc %mpi=mpich", "when": "%c"}]},
+            ["foo %[when=%c] c=gcc %[when=%c] mpi=mpich"],
+        ),
+        # Test that we don't get caching wrong in the parser
+        (
+            "foo %gcc-mpich ^bar%gcc-mpich",
+            {
+                "gcc-mpich": [
+                    {"spec": "%[virtuals=c] gcc", "when": "%c"},
+                    {"spec": "%[virtuals=mpi] mpich", "when": "%mpi"},
+                ]
+            },
+            [
+                "foo %[when=%c] c=gcc %[when=%mpi] mpi=mpich "
+                "^bar %[when=%c] c=gcc %[when=%mpi] mpi=mpich"
+            ],
+        ),
+        (
+            "foo %gcc-mpich ^bar%gcc-mpich",
+            {
+                "gcc-mpich": [
+                    {"spec": "%c=gcc", "when": "%c"},
+                    {"spec": "%mpi=mpich", "when": "%mpi"},
+                ]
+            },
+            [
+                "foo %[when=%c] c=gcc %[when=%mpi] mpi=mpich "
+                "^bar %[when=%c] c=gcc %[when=%mpi] mpi=mpich"
+            ],
+        ),
+    ],
+)
+def test_parse_toolchain(spec_str, toolchain, expected_roundtrip, mutable_config, mock_packages):
+    """Tests that toolchains are expanded correctly"""
+    parser = SpecParser(spec_str, Spec)
+    for expected in expected_roundtrip:
+        result = parser.next_spec()
+        expand_toolchains(result, toolchain)
+        assert expected == str(result)
 
-        self.check_parse("x ^y", "x@: ^y@:")
 
-    def test_parse_errors(self):
-        errors = ['x@@1.2', 'x ^y@@1.2', 'x@1.2::', 'x::']
-        self._check_raises(SpecParseError, errors)
+@pytest.mark.parametrize(
+    "text,expected_in_error",
+    [
+        ("x@@1.2", r"x@@1.2\n ^"),
+        ("y ^x@@1.2", r"y ^x@@1.2\n    ^"),
+        ("x@1.2::", r"x@1.2::\n      ^"),
+        ("x::", r"x::\n ^^"),
+        ("cflags=''-Wl,a,b,c''", r"cflags=''-Wl,a,b,c''\n            ^ ^ ^ ^^"),
+        ("@1.2:   develop   = foo", r"@1.2:   develop   = foo\n                  ^"),
+        ("@1.2:develop   = foo", r"@1.2:develop   = foo\n               ^"),
+        # = marks an exact version: neither a bound of a range nor the constraint of a git ref
+        ("x@=1:2", r"x@=1:2\n    ^"),
+        ("x@1:=2", r"x@1:=2\n    ^"),
+        ("x@git.foo==1.2", r"x@git.foo==1.2\n         ^^"),
+        ("x@git.foo=1:=2", r"x@git.foo=1:=2\n            ^"),
+    ],
+)
+def test_error_reporting(text, expected_in_error):
+    parser = SpecParser(text, Spec)
+    with pytest.raises(SpecTokenizationError) as exc:
+        parser.tokens()
 
-    def _check_hash_parse(self, spec):
-        """Check several ways to specify a spec by hash."""
-        # full hash
-        self.check_parse(str(spec), '/' + spec.dag_hash())
+    assert expected_in_error in str(exc), parser.tokens()
 
-        # partial hash
-        self.check_parse(str(spec), '/ ' + spec.dag_hash()[:5])
 
-        # name + hash
-        self.check_parse(str(spec), spec.name + '/' + spec.dag_hash())
+@pytest.mark.parametrize(
+    "text,tokens",
+    [
+        ("/abcde", [Token("DAG_HASH", value="/abcde")]),
+        (
+            "foo/abcde",
+            [Token("UNQUALIFIED_PACKAGE_NAME", value="foo"), Token("DAG_HASH", value="/abcde")],
+        ),
+        (
+            "foo@1.2.3 /abcde",
+            [
+                Token("UNQUALIFIED_PACKAGE_NAME", value="foo"),
+                Token("VERSION", value="@1.2.3"),
+                Token("DAG_HASH", value="/abcde"),
+            ],
+        ),
+    ],
+)
+def test_spec_by_hash_tokens(text, tokens):
+    parser = SpecParser(text, Spec)
+    assert parser.tokens() == tokens
 
-        # name + version + space + partial hash
-        self.check_parse(
-            str(spec), spec.name + '@' + str(spec.version) +
-            ' /' + spec.dag_hash()[:6])
 
-    @pytest.mark.db
-    def test_spec_by_hash(self, database):
-        specs = database.query()
-        assert len(specs)  # make sure something's in the DB
+@pytest.mark.db
+def test_spec_by_hash(database, monkeypatch, config):
+    mpileaks = database.query_one("mpileaks ^zmpi")
+    b = spack.concretize.concretize_one("pkg-b")
+    monkeypatch.setattr(
+        spack.binary_distribution, "update_cache_and_get_specs", lambda *args, **kwargs: [b]
+    )
 
-        for spec in specs:
-            self._check_hash_parse(spec)
+    hash_str = f"/{mpileaks.dag_hash()}"
+    parsed_spec = SpecParser(hash_str, Spec).next_spec()
+    spack.hash_lookup.replace_hash(parsed_spec)
+    assert parsed_spec == mpileaks
 
-    @pytest.mark.db
-    def test_dep_spec_by_hash(self, database):
-        mpileaks_zmpi = database.query_one('mpileaks ^zmpi')
-        zmpi = database.query_one('zmpi')
-        fake = database.query_one('fake')
+    short_hash_str = f"/{mpileaks.dag_hash()[:5]}"
+    parsed_spec = SpecParser(short_hash_str, Spec).next_spec()
+    spack.hash_lookup.replace_hash(parsed_spec)
+    assert parsed_spec == mpileaks
 
-        assert 'fake' in mpileaks_zmpi
-        assert 'zmpi' in mpileaks_zmpi
+    name_version_and_hash = f"{mpileaks.name}@{mpileaks.version} /{mpileaks.dag_hash()[:5]}"
+    parsed_spec = SpecParser(name_version_and_hash, Spec).next_spec()
+    spack.hash_lookup.replace_hash(parsed_spec)
+    assert parsed_spec == mpileaks
 
-        mpileaks_hash_fake = sp.Spec('mpileaks ^/' + fake.dag_hash())
-        assert 'fake' in mpileaks_hash_fake
-        assert mpileaks_hash_fake['fake'] == fake
+    b_hash = f"/{b.dag_hash()}"
+    parsed_spec = SpecParser(b_hash, Spec).next_spec()
+    spack.hash_lookup.replace_hash(parsed_spec)
+    assert parsed_spec == b
 
-        mpileaks_hash_zmpi = sp.Spec(
-            'mpileaks %' + str(mpileaks_zmpi.compiler) +
-            ' ^ / ' + zmpi.dag_hash())
-        assert 'zmpi' in mpileaks_hash_zmpi
-        assert mpileaks_hash_zmpi['zmpi'] == zmpi
-        assert mpileaks_hash_zmpi.compiler == mpileaks_zmpi.compiler
 
-        mpileaks_hash_fake_and_zmpi = sp.Spec(
-            'mpileaks ^/' + fake.dag_hash()[:4] + '^ / ' + zmpi.dag_hash()[:5])
-        assert 'zmpi' in mpileaks_hash_fake_and_zmpi
-        assert mpileaks_hash_fake_and_zmpi['zmpi'] == zmpi
+@pytest.mark.db
+def test_dep_spec_by_hash(database, config):
+    mpileaks_zmpi = database.query_one("mpileaks ^zmpi")
+    zmpi = database.query_one("zmpi")
+    fake = database.query_one("fake")
 
-        assert 'fake' in mpileaks_hash_fake_and_zmpi
-        assert mpileaks_hash_fake_and_zmpi['fake'] == fake
+    assert "fake" in mpileaks_zmpi
+    assert "zmpi" in mpileaks_zmpi
 
-    @pytest.mark.db
-    def test_multiple_specs_with_hash(self, database):
-        mpileaks_zmpi = database.query_one('mpileaks ^zmpi')
-        callpath_mpich2 = database.query_one('callpath ^mpich2')
+    mpileaks_hash_fake = SpecParser(f"mpileaks ^/{fake.dag_hash()} ^zmpi", Spec).next_spec()
+    spack.hash_lookup.replace_hash(mpileaks_hash_fake)
+    assert "fake" in mpileaks_hash_fake
+    assert mpileaks_hash_fake["fake"] == fake
+    assert "zmpi" in mpileaks_hash_fake
+    assert mpileaks_hash_fake["zmpi"] == spack.spec.Spec("zmpi")
 
-        # name + hash + separate hash
-        specs = sp.parse('mpileaks /' + mpileaks_zmpi.dag_hash() +
-                         '/' + callpath_mpich2.dag_hash())
+    mpileaks_hash_zmpi = SpecParser(f"mpileaks ^ /{zmpi.dag_hash()}", Spec).next_spec()
+    spack.hash_lookup.replace_hash(mpileaks_hash_zmpi)
+    assert "zmpi" in mpileaks_hash_zmpi
+    assert mpileaks_hash_zmpi["zmpi"] == zmpi
+
+    mpileaks_hash_fake_and_zmpi = SpecParser(
+        f"mpileaks ^/{fake.dag_hash()[:4]} ^ /{zmpi.dag_hash()[:5]}", Spec
+    ).next_spec()
+    spack.hash_lookup.replace_hash(mpileaks_hash_fake_and_zmpi)
+    assert "zmpi" in mpileaks_hash_fake_and_zmpi
+    assert mpileaks_hash_fake_and_zmpi["zmpi"] == zmpi
+
+    assert "fake" in mpileaks_hash_fake_and_zmpi
+    assert mpileaks_hash_fake_and_zmpi["fake"] == fake
+
+
+@pytest.mark.db
+def test_multiple_specs_with_hash(database, config):
+    mpileaks_zmpi = database.query_one("mpileaks ^zmpi")
+    callpath_mpich2 = database.query_one("callpath ^mpich2")
+
+    # name + hash + separate hash
+    specs = SpecParser(
+        f"mpileaks /{mpileaks_zmpi.dag_hash()} /{callpath_mpich2.dag_hash()}", Spec
+    ).all_specs()
+    assert len(specs) == 2
+
+    # 2 separate hashes
+    specs = SpecParser(
+        f"/{mpileaks_zmpi.dag_hash()} /{callpath_mpich2.dag_hash()}", Spec
+    ).all_specs()
+    assert len(specs) == 2
+
+    # 2 separate hashes + name
+    specs = SpecParser(
+        f"/{mpileaks_zmpi.dag_hash()} /{callpath_mpich2.dag_hash()} callpath", Spec
+    ).all_specs()
+    assert len(specs) == 3
+
+    # hash + 2 names
+    specs = SpecParser(f"/{mpileaks_zmpi.dag_hash()} callpath callpath", Spec).all_specs()
+    assert len(specs) == 3
+
+    # hash + name + hash
+    specs = SpecParser(
+        f"/{mpileaks_zmpi.dag_hash()} callpath /{callpath_mpich2.dag_hash()}", Spec
+    ).all_specs()
+    assert len(specs) == 2
+
+
+@pytest.mark.db
+def test_ambiguous_hash(mutable_database):
+    """Test that abstract hash ambiguity is delayed until concretization.
+    In the past this ambiguity error would happen during parse time."""
+
+    # This is a very sketchy as manually setting hashes easily breaks invariants
+    x1 = spack.concretize.concretize_one("pkg-a")
+    x2 = x1.copy()
+    x1._hash = "xxxyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+    x2._hash = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+    assert x1 != x2  # doesn't hold when only the dag hash is modified.
+
+    mutable_database.add(x1)
+    mutable_database.add(x2)
+
+    # ambiguity in first hash character
+    s1 = SpecParser("/xxx", Spec).next_spec()
+    with pytest.raises(spack.spec.AmbiguousHashError):
+        spack.hash_lookup.lookup_hash(s1)
+
+    # ambiguity in first hash character AND spec name
+    s2 = SpecParser("pkg-a/xxx", Spec).next_spec()
+    with pytest.raises(spack.spec.AmbiguousHashError):
+        spack.hash_lookup.lookup_hash(s2)
+
+
+@pytest.mark.db
+def test_invalid_hash(database, config):
+    zmpi = database.query_one("zmpi")
+    mpich = database.query_one("mpich")
+
+    # name + incompatible hash
+    with pytest.raises(spack.spec.InvalidHashError):
+        parsed_spec = SpecParser(f"zmpi /{mpich.dag_hash()}", Spec).next_spec()
+        spack.hash_lookup.replace_hash(parsed_spec)
+    with pytest.raises(spack.spec.InvalidHashError):
+        parsed_spec = SpecParser(f"mpich /{zmpi.dag_hash()}", Spec).next_spec()
+        spack.hash_lookup.replace_hash(parsed_spec)
+
+    # name + dep + incompatible hash
+    with pytest.raises(spack.spec.InvalidHashError):
+        parsed_spec = SpecParser(f"mpileaks ^zmpi /{mpich.dag_hash()}", Spec).next_spec()
+        spack.hash_lookup.replace_hash(parsed_spec)
+
+
+def test_invalid_hash_dep(database, config):
+    mpich = database.query_one("mpich")
+    hash = mpich.dag_hash()
+    with pytest.raises(spack.spec.InvalidHashError):
+        s = spack.spec.Spec(f"callpath ^zlib/{hash}")
+        spack.hash_lookup.replace_hash(s)
+
+
+@pytest.mark.db
+def test_nonexistent_hash(database, config):
+    """Ensure we get errors for non existent hashes."""
+    specs = database.query()
+
+    # This hash shouldn't be in the test DB.  What are the odds :)
+    no_such_hash = "aaaaaaaaaaaaaaa"
+    hashes = [s._hash for s in specs]
+    assert no_such_hash not in [h[: len(no_such_hash)] for h in hashes]
+
+    with pytest.raises(spack.spec.InvalidHashError):
+        parsed_spec = SpecParser(f"/{no_such_hash}", Spec).next_spec()
+        spack.hash_lookup.replace_hash(parsed_spec)
+
+
+@pytest.mark.parametrize(
+    "spec1,spec2,constraint",
+    [
+        ("zlib", "hdf5", None),
+        ("zlib+shared", "zlib~shared", "+shared"),
+        ("hdf5+mpi^zmpi", "hdf5~mpi", "^zmpi"),
+        ("hdf5+mpi^mpich+debug", "hdf5+mpi^mpich~debug", "^mpich+debug"),
+    ],
+)
+def test_disambiguate_hash_by_spec(spec1, spec2, constraint, mock_packages, monkeypatch, config):
+    spec1_concrete = spack.concretize.concretize_one(spec1)
+    spec2_concrete = spack.concretize.concretize_one(spec2)
+
+    spec1_concrete._hash = "spec1"
+    spec2_concrete._hash = "spec2"
+
+    monkeypatch.setattr(
+        spack.binary_distribution,
+        "update_cache_and_get_specs",
+        lambda *args, **kwargs: [spec1_concrete, spec2_concrete],
+    )
+
+    # Ordering is tricky -- for constraints we want after, for names we want before
+    if not constraint:
+        spec = spack.spec.Spec(spec1 + "/spec")
+    else:
+        spec = spack.spec.Spec("/spec" + constraint)
+
+    assert spack.hash_lookup.lookup_hash(spec) == spec1_concrete
+
+
+@pytest.mark.parametrize(
+    "text,match_string",
+    [
+        # Duplicate variants
+        ("x@1.2+debug+debug", "variant"),
+        ("x ^y@1.2+debug debug=true", "variant"),
+        ("x ^y@1.2 debug=false debug=true", "variant"),
+        ("x ^y@1.2 debug=false ~debug", "variant"),
+        # Multiple versions
+        ("x@1.2@2.3", "version"),
+        ("x@1.2:2.3@1.4", "version"),
+        ("x@1.2@2.3:2.4", "version"),
+        ("x@1.2@2.3,2.4", "version"),
+        ("x@1.2 +foo~bar @2.3", "version"),
+        ("x@1.2%y@1.2@2.3:2.4", "version"),
+        # Duplicate Architectures
+        ("x arch=linux-rhel7-x86_64 arch=linux-rhel7-x86_64", "two architectures"),
+        ("x arch=linux-rhel7-x86_64 arch=linux-rhel7-ppc64le", "two architectures"),
+        ("x arch=linux-rhel7-ppc64le arch=linux-rhel7-x86_64", "two architectures"),
+        ("y ^x arch=linux-rhel7-x86_64 arch=linux-rhel7-x86_64", "two architectures"),
+        ("y ^x arch=linux-rhel7-x86_64 arch=linux-rhel7-ppc64le", "two architectures"),
+        ("x os=redhat6 os=debian6", "'os'"),
+        ("x os=debian6 os=redhat6", "'os'"),
+        ("x target=core2 target=x86_64", "'target'"),
+        ("x target=x86_64 target=core2", "'target'"),
+        ("x platform=test platform=test", "'platform'"),
+        # TODO: these two seem wrong: need to change how arch is initialized (should fail on os)
+        ("x os=debian6 platform=test target=default_target os=redhat6", "two architectures"),
+        ("x target=default_target platform=test os=redhat6 os=debian6", "'platform'"),
+        # Dependencies
+        ("^[@foo] zlib", "expected an edge attribute or `]`"),
+        # TODO: Remove this as soon as use variants are added and we can parse custom attributes
+        ("^[foo=bar] zlib", "edge attributes"),
+        # Propagating reserved names generates a parse error
+        ("x namespace==foo.bar.baz", "Propagation"),
+        ("x arch==linux-rhel9-x86_64", "Propagation"),
+        ("x architecture==linux-rhel9-x86_64", "Propagation"),
+        ("x os==rhel9", "Propagation"),
+        ("x operating_system==rhel9", "Propagation"),
+        ("x target==x86_64", "Propagation"),
+        ("x dev_path==/foo/bar/baz", "Propagation"),
+        ("x patches==abcde12345,12345abcde", "Propagation"),
+        # a when= condition is a spec, which extends up to the closing bracket
+        ("foo ^[when=] bar", "expected a spec after when="),
+        ("foo ^[when=", "expected a spec after when="),
+        ("foo ^[when=][virtuals=c] bar", "expected a spec after when="),
+        # a reopened group of edge properties must be closed too
+        ("foo ^[when=+a][virtuals=c bar", "expected an edge attribute or `]`"),
+        ("foo ^[when=+a][virtuals=c", "expected `]` to close the edge attributes"),
+        ("foo ^[when=bar baz] qux", "expected an edge attribute or `]`"),
+        ("foo ^[when=bar ^baz", "expected `]` to close the edge attributes"),
+        # a quoted condition is a single spec: neither two specs nor none
+        ("foo ^[when='bar baz'] qux", "expected a single spec as the when= condition"),
+        ("foo ^[when=''] qux", "expected a single spec as the when= condition"),
+        # the parts of an architecture and the namespace print unquoted, so they must be values
+        # that parse without quotes, and a namespace a dotted identifier
+        ("x os='a b'", "invalid value"),
+        ("x target='x?y'", "invalid value"),
+        ("x platform=''", "invalid value"),
+        ("x os=''", "invalid value"),
+        ("x arch='a b'", "invalid value"),
+        ("x namespace=a+b", "invalid value"),
+        ("x namespace=','", "invalid value"),
+        ("x namespace=''", "invalid value"),
+        # they have a string value like arch, so the bool variant form is an error rather than
+        # silently dropped
+        ("x ~os", "must have a string value"),
+        ("x ~platform", "must have a string value"),
+        ("x ~target", "must have a string value"),
+        ("x ~namespace", "must have a string value"),
+        ("x +os", "must have a string value"),
+        # a virtual assignment must directly follow a dependency sigil or edge properties
+        ("c,cxx=gcc", "virtual assignment"),
+        ("zlib c,cxx=gcc", "virtual assignment"),
+        ("zlib %[c=gcc]", "edge attributes"),
+        # regression: an unconsumed token used to make the parser loop forever
+        ("zlib ]", "unexpected token"),
+        # The same variant cannot be specified twice, set or propagated
+        ("x +foo +foo", "twice"),
+        ("x +foo ~foo", "twice"),
+        ("x foo=bar foo=baz", "twice"),
+        ("x ++foo ~~foo", "twice"),
+        ("x foo==bar foo==baz", "twice"),
+        # a propagated bool applies to the node itself, so it cannot contradict its variant
+        ("x +foo ~~foo", "does not satisfy"),
+        ("x ~foo ++foo", "does not satisfy"),
+    ],
+)
+def test_error_conditions(text, match_string):
+    with pytest.raises(SpecParsingError, match=match_string):
+        SpecParser(text, Spec).all_specs()
+
+
+@pytest.mark.parametrize(
+    "text,exc_cls",
+    [
+        # Specfile related errors
+        pytest.param(
+            "/bogus/path/libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_WINDOWS
+        ),
+        pytest.param(
+            "../../libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_WINDOWS
+        ),
+        pytest.param("./libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_WINDOWS),
+        pytest.param(
+            "libfoo ^/bogus/path/libdwarf.yaml",
+            spack.error.NoSuchSpecFileError,
+            marks=SKIP_ON_WINDOWS,
+        ),
+        pytest.param(
+            "libfoo ^../../libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_WINDOWS
+        ),
+        pytest.param(
+            "libfoo ^./libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_WINDOWS
+        ),
+        pytest.param(
+            "/bogus/path/libdwarf.yamlfoobar",
+            spack.error.NoSuchSpecFileError,
+            marks=SKIP_ON_WINDOWS,
+        ),
+        pytest.param(
+            "libdwarf^/bogus/path/libelf.yamlfoobar ^/path/to/bogus.yaml",
+            spack.error.NoSuchSpecFileError,
+            marks=SKIP_ON_WINDOWS,
+        ),
+        pytest.param(
+            "c:\\bogus\\path\\libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_UNIX
+        ),
+        pytest.param("..\\..\\libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_UNIX),
+        pytest.param(".\\libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_UNIX),
+        pytest.param(
+            "libfoo ^c:\\bogus\\path\\libdwarf.yaml",
+            spack.error.NoSuchSpecFileError,
+            marks=SKIP_ON_UNIX,
+        ),
+        pytest.param(
+            "libfoo ^..\\..\\libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_UNIX
+        ),
+        pytest.param(
+            "libfoo ^.\\libdwarf.yaml", spack.error.NoSuchSpecFileError, marks=SKIP_ON_UNIX
+        ),
+        pytest.param(
+            "c:\\bogus\\path\\libdwarf.yamlfoobar",
+            spack.error.SpecFilenameError,
+            marks=SKIP_ON_UNIX,
+        ),
+        pytest.param(
+            "libdwarf^c:\\bogus\\path\\libelf.yamlfoobar ^c:\\path\\to\\bogus.yaml",
+            spack.error.SpecFilenameError,
+            marks=SKIP_ON_UNIX,
+        ),
+    ],
+)
+def test_specfile_error_conditions_windows(text, exc_cls):
+    with pytest.raises(exc_cls):
+        SpecParser(text, Spec).all_specs()
+
+
+@pytest.mark.parametrize(
+    "filename,regex",
+    [
+        (r"c:\abs\windows\\path.yaml", WINDOWS_FILENAME),
+        (r".\\relative\\dot\\win\\path.yaml", WINDOWS_FILENAME),
+        (r"relative\\windows\\path.yaml", WINDOWS_FILENAME),
+        ("/absolute/path/to/file.yaml", UNIX_FILENAME),
+        ("relative/path/to/file.yaml", UNIX_FILENAME),
+        ("./dot/rel/to/file.yaml", UNIX_FILENAME),
+    ],
+)
+def test_specfile_parsing(filename, regex):
+    match = re.match(regex, filename)
+    assert match
+    assert match.end() == len(filename)
+
+
+def test_parse_specfile_simple(specfile_for, tmp_path: pathlib.Path):
+    specfile = tmp_path / "libdwarf.json"
+    s = specfile_for("libdwarf", specfile)
+
+    spec = SpecParser(str(specfile), Spec).next_spec()
+    assert spec == s
+
+    # Check we can mix literal and spec-file in text
+    specs = SpecParser(f"mvapich_foo {str(specfile)}", Spec).all_specs()
+    assert len(specs) == 2
+
+
+@pytest.mark.parametrize("filename", ["libelf.yaml", "libelf.json"])
+def test_parse_filename_missing_slash_as_spec(specfile_for, tmp_path: pathlib.Path, filename):
+    """Ensure that libelf(.yaml|.json) parses as a spec, NOT a file."""
+    specfile = tmp_path / filename
+    specfile_for(filename.split(".")[0], specfile)
+
+    # Move to where the specfile is located so that libelf.yaml is there
+    with fs.working_dir(str(tmp_path)):
+        specs = SpecParser("libelf.yaml", Spec).all_specs()
+    assert len(specs) == 1
+
+    spec = specs[0]
+    assert spec.name == "yaml"
+    assert spec.namespace == "libelf"
+    assert spec.fullname == "libelf.yaml"
+
+    # Check that if we concretize this spec, we get a good error
+    # message that mentions we might've meant a file.
+    with pytest.raises(spack.repo.UnknownEntityError) as exc_info:
+        spack.concretize.concretize_one(spec)
+    assert exc_info.value.long_message
+    assert (
+        "Did you mean to specify a filename with './libelf.yaml'?" in exc_info.value.long_message
+    )
+
+    # make sure that only happens when the spec ends in yaml
+    with pytest.raises(spack.solver.asp.UnsatisfiableSpecError) as exc_info:
+        spack.concretize.concretize_one("builtin_mock.doesnotexist")
+    assert not exc_info.value.long_message or (
+        "Did you mean to specify a filename with" not in exc_info.value.long_message
+    )
+
+
+def test_parse_specfile_dependency(config, mock_packages, tmp_path: pathlib.Path):
+    """Ensure we can use a specfile as a dependency"""
+    s = spack.concretize.concretize_one("libdwarf")
+
+    specfile = tmp_path / "libelf.json"
+    with open(specfile, "w", encoding="utf-8") as f:
+        f.write(s["libelf"].to_json())
+
+    # Make sure we can use yaml path as dependency, e.g.:
+    #     "spack spec libdwarf ^ /path/to/libelf.json"
+    spec = SpecParser(f"libdwarf ^ {str(specfile)}", Spec).next_spec()
+    assert spec and spec["libelf"] == s["libelf"]
+
+    with fs.working_dir(str(tmp_path)):
+        # Make sure this also works: "spack spec ./libelf.yaml"
+        spec = SpecParser(f"libdwarf^.{os.path.sep}{specfile.name}", Spec).next_spec()
+        assert spec and spec["libelf"] == s["libelf"]
+
+        # Should also be accepted: "spack spec ../<cur-dir>/libelf.yaml"
+        spec = SpecParser(
+            f"libdwarf^..{os.path.sep}{specfile.parent.name}{os.path.sep}{specfile.name}", Spec
+        ).next_spec()
+        assert spec and spec["libelf"] == s["libelf"]
+
+
+def test_parse_specfile_relative_paths(specfile_for, tmp_path: pathlib.Path):
+    specfile = tmp_path / "libdwarf.json"
+    s = specfile_for("libdwarf", specfile)
+
+    basename = specfile.name
+    parent_dir = specfile.parent
+
+    with fs.working_dir(str(parent_dir)):
+        # Make sure this also works: "spack spec ./libelf.yaml"
+        spec = SpecParser(f".{os.path.sep}{basename}", Spec).next_spec()
+        assert spec == s
+
+        # Should also be accepted: "spack spec ../<cur-dir>/libelf.yaml"
+        spec = SpecParser(
+            f"..{os.path.sep}{parent_dir.name}{os.path.sep}{basename}", Spec
+        ).next_spec()
+        assert spec == s
+
+        # Should also handle mixed clispecs and relative paths, e.g.:
+        #     "spack spec mvapich_foo ../<cur-dir>/libelf.yaml"
+        specs = SpecParser(
+            f"mvapich_foo ..{os.path.sep}{parent_dir.name}{os.path.sep}{basename}", Spec
+        ).all_specs()
         assert len(specs) == 2
-
-        # 2 separate hashes
-        specs = sp.parse('/' + mpileaks_zmpi.dag_hash() +
-                         '/' + callpath_mpich2.dag_hash())
-        assert len(specs) == 2
-
-        # 2 separate hashes + name
-        specs = sp.parse('/' + mpileaks_zmpi.dag_hash() +
-                         '/' + callpath_mpich2.dag_hash() +
-                         ' callpath')
-        assert len(specs) == 3
-
-        # hash + 2 names
-        specs = sp.parse('/' + mpileaks_zmpi.dag_hash() +
-                         ' callpath' +
-                         ' callpath')
-        assert len(specs) == 3
-
-        # hash + name + hash
-        specs = sp.parse('/' + mpileaks_zmpi.dag_hash() +
-                         ' callpath' +
-                         ' / ' + callpath_mpich2.dag_hash())
-        assert len(specs) == 2
-
-    @pytest.mark.db
-    def test_ambiguous_hash(self, mutable_database):
-        x1 = Spec('a')
-        x1.concretize()
-        x1._hash = 'xyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'
-        x2 = Spec('a')
-        x2.concretize()
-        x2._hash = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
-
-        mutable_database.add(x1, spack.store.layout)
-        mutable_database.add(x2, spack.store.layout)
-
-        # ambiguity in first hash character
-        self._check_raises(AmbiguousHashError, ['/x'])
-
-        # ambiguity in first hash character AND spec name
-        self._check_raises(AmbiguousHashError, ['a/x'])
-
-    @pytest.mark.db
-    def test_invalid_hash(self, database):
-        mpileaks_zmpi = database.query_one('mpileaks ^zmpi')
-        zmpi = database.query_one('zmpi')
-
-        mpileaks_mpich = database.query_one('mpileaks ^mpich')
-        mpich = database.query_one('mpich')
-
-        # name + incompatible hash
-        self._check_raises(InvalidHashError, [
-            'zmpi /' + mpich.dag_hash(),
-            'mpich /' + zmpi.dag_hash()])
-
-        # name + dep + incompatible hash
-        self._check_raises(InvalidHashError, [
-            'mpileaks ^mpich /' + mpileaks_zmpi.dag_hash(),
-            'mpileaks ^zmpi /' + mpileaks_mpich.dag_hash()])
-
-    @pytest.mark.db
-    def test_nonexistent_hash(self, database):
-        """Ensure we get errors for nonexistant hashes."""
-        specs = database.query()
-
-        # This hash shouldn't be in the test DB.  What are the odds :)
-        no_such_hash = 'aaaaaaaaaaaaaaa'
-        hashes = [s._hash for s in specs]
-        assert no_such_hash not in [h[:len(no_such_hash)] for h in hashes]
-
-        self._check_raises(NoSuchHashError, [
-            '/' + no_such_hash,
-            'mpileaks /' + no_such_hash])
-
-    @pytest.mark.db
-    def test_redundant_spec(self, database):
-        """Check that redundant spec constraints raise errors.
-
-        TODO (TG): does this need to be an error? Or should concrete
-        specs only raise errors if constraints cause a contradiction?
-
-        """
-        mpileaks_zmpi = database.query_one('mpileaks ^zmpi')
-        callpath_zmpi = database.query_one('callpath ^zmpi')
-        dyninst = database.query_one('dyninst')
-
-        mpileaks_mpich2 = database.query_one('mpileaks ^mpich2')
-
-        redundant_specs = [
-            # redudant compiler
-            '/' + mpileaks_zmpi.dag_hash() + '%' + str(mpileaks_zmpi.compiler),
-
-            # redudant version
-            'mpileaks/' + mpileaks_mpich2.dag_hash() +
-            '@' + str(mpileaks_mpich2.version),
-
-            # redundant dependency
-            'callpath /' + callpath_zmpi.dag_hash() + '^ libelf',
-
-            # redundant flags
-            '/' + dyninst.dag_hash() + ' cflags="-O3 -fPIC"']
-
-        self._check_raises(RedundantSpecError, redundant_specs)
-
-    def test_duplicate_variant(self):
-        duplicates = [
-            'x@1.2+debug+debug',
-            'x ^y@1.2+debug debug=true',
-            'x ^y@1.2 debug=false debug=true',
-            'x ^y@1.2 debug=false ~debug'
-        ]
-        self._check_raises(DuplicateVariantError, duplicates)
-
-    def test_multiple_versions(self):
-        multiples = [
-            'x@1.2@2.3',
-            'x@1.2:2.3@1.4',
-            'x@1.2@2.3:2.4',
-            'x@1.2@2.3,2.4',
-            'x@1.2 +foo~bar @2.3',
-            'x@1.2%y@1.2@2.3:2.4',
-        ]
-        self._check_raises(MultipleVersionError, multiples)
-
-    def test_duplicate_dependency(self):
-        self._check_raises(DuplicateDependencyError, ["x ^y ^y"])
-
-    def test_duplicate_compiler(self):
-        duplicates = [
-            "x%intel%intel",
-            "x%intel%gcc",
-            "x%gcc%intel",
-            "x ^y%intel%intel",
-            "x ^y%intel%gcc",
-            "x ^y%gcc%intel"
-        ]
-        self._check_raises(DuplicateCompilerSpecError, duplicates)
-
-    def test_duplicate_architecture(self):
-        duplicates = [
-            "x arch=linux-rhel7-x86_64 arch=linux-rhel7-x86_64",
-            "x arch=linux-rhel7-x86_64 arch=linux-rhel7-ppc64le",
-            "x arch=linux-rhel7-ppc64le arch=linux-rhel7-x86_64",
-            "y ^x arch=linux-rhel7-x86_64 arch=linux-rhel7-x86_64",
-            "y ^x arch=linux-rhel7-x86_64 arch=linux-rhel7-ppc64le"
-        ]
-        self._check_raises(DuplicateArchitectureError, duplicates)
-
-    def test_duplicate_architecture_component(self):
-        duplicates = [
-            "x os=fe os=fe",
-            "x os=fe os=be",
-            "x target=fe target=fe",
-            "x target=fe target=be",
-            "x platform=test platform=test",
-            "x os=fe platform=test target=fe os=fe",
-            "x target=be platform=test os=be os=fe"
-        ]
-        self._check_raises(DuplicateArchitectureError, duplicates)
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_yaml_simple(self, mock_packages, tmpdir):
-        s = Spec('libdwarf')
-        s.concretize()
-
-        specfile = tmpdir.join('libdwarf.yaml')
-
-        with specfile.open('w') as f:
-            f.write(s.to_yaml(hash=ht.build_hash))
-
-        # Check an absolute path to spec.yaml by itself:
-        #     "spack spec /path/to/libdwarf.yaml"
-        specs = sp.parse(specfile.strpath)
-        assert len(specs) == 1
-
-        # Check absolute path to spec.yaml mixed with a clispec, e.g.:
-        #     "spack spec mvapich_foo /path/to/libdwarf.yaml"
-        specs = sp.parse('mvapich_foo {0}'.format(specfile.strpath))
-        assert len(specs) == 2
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_filename_missing_slash_as_spec(self, mock_packages, tmpdir):
-        """Ensure that libelf.yaml parses as a spec, NOT a file."""
-        s = Spec('libelf')
-        s.concretize()
-
-        specfile = tmpdir.join('libelf.yaml')
-
-        # write the file to the current directory to make sure it exists,
-        # and that we still do not parse the spec as a file.
-        with specfile.open('w') as f:
-            f.write(s.to_yaml(hash=ht.build_hash))
-
-        # Check the spec `libelf.yaml` in the working directory, which
-        # should evaluate to a spec called `yaml` in the `libelf`
-        # namespace, NOT a spec for `libelf`.
-        with tmpdir.as_cwd():
-            specs = sp.parse("libelf.yaml")
-        assert len(specs) == 1
-
-        spec = specs[0]
-        assert spec.name == "yaml"
-        assert spec.namespace == "libelf"
-        assert spec.fullname == "libelf.yaml"
-
-        # check that if we concretize this spec, we get a good error
-        # message that mentions we might've meant a file.
-        with pytest.raises(spack.repo.UnknownPackageError) as exc_info:
-            spec.concretize()
-        assert exc_info.value.long_message
-        assert ("Did you mean to specify a filename with './libelf.yaml'?"
-                in exc_info.value.long_message)
-
-        # make sure that only happens when the spec ends in yaml
-        with pytest.raises(spack.repo.UnknownPackageError) as exc_info:
-            Spec('builtin.mock.doesnotexist').concretize()
-        assert (
-            not exc_info.value.long_message or (
-                "Did you mean to specify a filename with" not in
-                exc_info.value.long_message
-            )
-        )
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_yaml_dependency(self, mock_packages, tmpdir):
-        s = Spec('libdwarf')
-        s.concretize()
-
-        specfile = tmpdir.join('libelf.yaml')
-
-        with specfile.open('w') as f:
-            f.write(s['libelf'].to_yaml(hash=ht.build_hash))
-
-        # Make sure we can use yaml path as dependency, e.g.:
-        #     "spack spec libdwarf ^ /path/to/libelf.yaml"
-        specs = sp.parse('libdwarf ^ {0}'.format(specfile.strpath))
-        assert len(specs) == 1
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_yaml_relative_paths(self, mock_packages, tmpdir):
-        s = Spec('libdwarf')
-        s.concretize()
-
-        specfile = tmpdir.join('libdwarf.yaml')
-
-        with specfile.open('w') as f:
-            f.write(s.to_yaml(hash=ht.build_hash))
-
-        file_name = specfile.basename
-        parent_dir = os.path.basename(specfile.dirname)
-
-        # Relative path to specfile
-        with fs.working_dir(specfile.dirname):
-            # Test for command like: "spack spec libelf.yaml"
-            # This should parse a single spec, but should not concretize.
-            # See test_parse_filename_missing_slash_as_spec()
-            specs = sp.parse('{0}'.format(file_name))
-            assert len(specs) == 1
-
-            # Make sure this also works: "spack spec ./libelf.yaml"
-            specs = sp.parse('./{0}'.format(file_name))
-            assert len(specs) == 1
-
-            # Should also be accepted: "spack spec ../<cur-dir>/libelf.yaml"
-            specs = sp.parse('../{0}/{1}'.format(parent_dir, file_name))
-            assert len(specs) == 1
-
-            # Should also handle mixed clispecs and relative paths, e.g.:
-            #     "spack spec mvapich_foo ../<cur-dir>/libelf.yaml"
-            specs = sp.parse('mvapich_foo ../{0}/{1}'.format(
-                parent_dir, file_name))
-            assert len(specs) == 2
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_yaml_relative_subdir_path(self, mock_packages, tmpdir):
-        s = Spec('libdwarf')
-        s.concretize()
-
-        specfile = tmpdir.mkdir('subdir').join('libdwarf.yaml')
-
-        with specfile.open('w') as f:
-            f.write(s.to_yaml(hash=ht.build_hash))
-
-        file_name = specfile.basename
-
-        # Relative path to specfile
-        with tmpdir.as_cwd():
-            assert os.path.exists('subdir/{0}'.format(file_name))
-
-            # Test for command like: "spack spec libelf.yaml"
-            specs = sp.parse('subdir/{0}'.format(file_name))
-            assert len(specs) == 1
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_yaml_dependency_relative_paths(self, mock_packages, tmpdir):
-        s = Spec('libdwarf')
-        s.concretize()
-
-        specfile = tmpdir.join('libelf.yaml')
-
-        with specfile.open('w') as f:
-            f.write(s['libelf'].to_yaml(hash=ht.build_hash))
-
-        file_name = specfile.basename
-        parent_dir = os.path.basename(specfile.dirname)
-
-        # Relative path to specfile
-        with fs.working_dir(specfile.dirname):
-            # Test for command like: "spack spec libelf.yaml"
-            specs = sp.parse('libdwarf^{0}'.format(file_name))
-            assert len(specs) == 1
-
-            # Make sure this also works: "spack spec ./libelf.yaml"
-            specs = sp.parse('libdwarf^./{0}'.format(file_name))
-            assert len(specs) == 1
-
-            # Should also be accepted: "spack spec ../<cur-dir>/libelf.yaml"
-            specs = sp.parse('libdwarf^../{0}/{1}'.format(
-                parent_dir, file_name))
-            assert len(specs) == 1
-
-    def test_parse_yaml_error_handling(self):
-        self._check_raises(NoSuchSpecFileError, [
-            # Single spec that looks like a yaml path
-            '/bogus/path/libdwarf.yaml',
-            '../../libdwarf.yaml',
-            './libdwarf.yaml',
-            # Dependency spec that looks like a yaml path
-            'libdwarf^/bogus/path/libelf.yaml',
-            'libdwarf ^../../libelf.yaml',
-            'libdwarf^ ./libelf.yaml',
-            # Multiple specs, one looks like a yaml path
-            'mvapich_foo /bogus/path/libelf.yaml',
-            'mvapich_foo ../../libelf.yaml',
-            'mvapich_foo ./libelf.yaml',
-        ])
-
-    def test_nice_error_for_no_space_after_spec_filename(self):
-        """Ensure that omitted spaces don't give weird errors about hashes."""
-        self._check_raises(SpecFilenameError, [
-            '/bogus/path/libdwarf.yamlfoobar',
-            'libdwarf^/bogus/path/libelf.yamlfoobar ^/path/to/bogus.yaml',
-        ])
-
-    @pytest.mark.usefixtures('config')
-    def test_yaml_spec_not_filename(self, mock_packages, tmpdir):
-        with pytest.raises(spack.repo.UnknownPackageError):
-            Spec('builtin.mock.yaml').concretize()
-
-        with pytest.raises(spack.repo.UnknownPackageError):
-            Spec('builtin.mock.yamlfoobar').concretize()
-
-    @pytest.mark.usefixtures('config')
-    def test_parse_yaml_variant_error(self, mock_packages, tmpdir):
-        s = Spec('a')
-        s.concretize()
-
-        specfile = tmpdir.join('a.yaml')
-
-        with specfile.open('w') as f:
-            f.write(s.to_yaml(hash=ht.build_hash))
-
-        with pytest.raises(RedundantSpecError):
-            # Trying to change a variant on a concrete spec is an error
-            sp.parse('{0} ~bvv'.format(specfile.strpath))
-
-    # ========================================================================
-    # Lex checks
-    # ========================================================================
-    def test_ambiguous(self):
-        # This first one is ambiguous because - can be in an identifier AND
-        # indicate disabling an option.
-        with pytest.raises(AssertionError):
-            self.check_lex(
-                complex_lex,
-                "mvapich_foo"
-                "^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug-qt_4"
-                "^stackwalker@8.1_1e"
-            )
-
-    # The following lexes are non-ambiguous (add a space before -qt_4)
-    # and should all result in the tokens in complex_lex
-    def test_minimal_spaces(self):
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo"
-            "^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug -qt_4"
-            "^stackwalker@8.1_1e")
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo"
-            "^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug~qt_4"
-            "^stackwalker@8.1_1e")
-
-    def test_spaces_between_dependences(self):
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo "
-            "^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug -qt_4 "
-            "^stackwalker @ 8.1_1e")
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo "
-            "^_openmpi@1.2:1.4,1.6%intel@12.1:12.6+debug~qt_4 "
-            "^stackwalker @ 8.1_1e")
-
-    def test_spaces_between_options(self):
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo "
-            "^_openmpi @1.2:1.4,1.6 %intel @12.1:12.6 +debug -qt_4 "
-            "^stackwalker @8.1_1e")
-
-    def test_way_too_many_spaces(self):
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-        self.check_lex(
-            complex_lex,
-            "mvapich_foo "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug ~ qt_4 "
-            "^ stackwalker @ 8.1_1e")
-
-    def test_kv_with_quotes(self):
-        self.check_lex(
-            kv_lex,
-            "mvapich_foo debug='4' "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-        self.check_lex(
-            kv_lex,
-            'mvapich_foo debug="4" '
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-        self.check_lex(
-            kv_lex,
-            "mvapich_foo 'debug = 4' "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-
-    def test_kv_without_quotes(self):
-        self.check_lex(
-            kv_lex,
-            "mvapich_foo debug=4 "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-
-    def test_kv_with_spaces(self):
-        self.check_lex(
-            kv_lex,
-            "mvapich_foo debug = 4 "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-        self.check_lex(
-            kv_lex,
-            "mvapich_foo debug =4 "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-        self.check_lex(
-            kv_lex,
-            "mvapich_foo debug= 4 "
-            "^ _openmpi @1.2 : 1.4 , 1.6 % intel @ 12.1 : 12.6 + debug - qt_4 "
-            "^ stackwalker @ 8.1_1e")
-
-    @pytest.mark.parametrize('expected_tokens,spec_string', [
-        ([Token(sp.ID, 'target'),
-          Token(sp.EQ, '='),
-          Token(sp.VAL, 'broadwell')],
-         'target=broadwell'),
-        ([Token(sp.ID, 'target'),
-          Token(sp.EQ, '='),
-          Token(sp.VAL, ':broadwell,icelake')],
-         'target=:broadwell,icelake')
-    ])
-    def test_target_tokenization(self, expected_tokens, spec_string):
-        self.check_lex(expected_tokens, spec_string)
-
-    @pytest.mark.regression('20310')
-    def test_compare_abstract_specs(self):
-        """Spec comparisons must be valid for abstract specs.
-
-        Check that the spec cmp_key appropriately handles comparing specs for
-        which some attributes are None in exactly one of two specs"""
-        # Add fields in order they appear in `Spec._cmp_node`
-        constraints = [
-            None,
-            'foo',
-            'foo.foo',
-            'foo.foo@foo',
-            'foo.foo@foo+foo',
-            'foo.foo@foo+foo arch=foo-foo-foo',
-            'foo.foo@foo+foo arch=foo-foo-foo %foo',
-            'foo.foo@foo+foo arch=foo-foo-foo %foo cflags=foo',
-        ]
-        specs = [Spec(s) for s in constraints]
-
-        for a, b in itertools.product(specs, repeat=2):
-            # Check that we can compare without raising an error
-            assert a <= b or b < a
+        assert specs[1] == s
+
+
+def test_parse_specfile_relative_subdir_path(specfile_for, tmp_path: pathlib.Path):
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    specfile = subdir / "libdwarf.json"
+    s = specfile_for("libdwarf", specfile)
+
+    with fs.working_dir(str(tmp_path)):
+        spec = SpecParser(f"subdir{os.path.sep}{specfile.name}", Spec).next_spec()
+        assert spec == s
+
+
+@pytest.mark.regression("20310")
+def test_compare_abstract_specs():
+    """Spec comparisons must be valid for abstract specs.
+
+    Check that the spec cmp_key appropriately handles comparing specs for
+    which some attributes are None in exactly one of two specs
+    """
+    # Add fields in order they appear in `Spec._cmp_node`
+    constraints = [
+        "foo",
+        "foo.foo",
+        "foo.foo@foo",
+        "foo.foo@foo+foo",
+        "foo.foo@foo+foo arch=foo-foo-foo",
+        "foo.foo@foo+foo arch=foo-foo-foo %foo",
+        "foo.foo@foo+foo arch=foo-foo-foo cflags=foo %foo",
+    ]
+    specs = [SpecParser(s, Spec).next_spec() for s in constraints]
+
+    for a, b in itertools.product(specs, repeat=2):
+        # Check that we can compare without raising an error
+        assert a <= b or b < a
+
+
+@pytest.mark.parametrize(
+    "lhs_str,rhs_str,expected",
+    [
+        # Git shasum vs generic develop
+        (
+            f"develop-branch-version@git.{'a' * 40}=develop",
+            "develop-branch-version@develop",
+            (True, True, False),
+        ),
+        # Two different shasums
+        (
+            f"develop-branch-version@git.{'a' * 40}=develop",
+            f"develop-branch-version@git.{'b' * 40}=develop",
+            (False, False, False),
+        ),
+        # Git shasum vs. git tag
+        (
+            f"develop-branch-version@git.{'a' * 40}=develop",
+            "develop-branch-version@git.0.2.15=develop",
+            (False, False, False),
+        ),
+        # Git tag vs. generic develop
+        (
+            "develop-branch-version@git.0.2.15=develop",
+            "develop-branch-version@develop",
+            (True, True, False),
+        ),
+    ],
+)
+def test_git_ref_spec_equivalences(mock_packages, lhs_str, rhs_str, expected):
+    lhs = SpecParser(lhs_str, Spec).next_spec()
+    rhs = SpecParser(rhs_str, Spec).next_spec()
+    intersect, lhs_sat_rhs, rhs_sat_lhs = expected
+
+    assert lhs.intersects(rhs) is intersect
+    assert rhs.intersects(lhs) is intersect
+    assert lhs.satisfies(rhs) is lhs_sat_rhs
+    assert rhs.satisfies(lhs) is rhs_sat_lhs
+
+
+def test_uppercase_hash_is_not_a_git_version():
+    """A git commit hash can only be written in lowercase. With mixed case it's a version range."""
+    mixed = "894CaF3Ce2AE06Abe360C0FB39EF0dEB5BDD8510"
+    spec = spack.spec.Spec(f"x@{mixed}")
+    assert not isinstance(spec.versions[0], spack.version.GitVersion)
+    assert spack.spec.Spec(str(spec)) == spec
+    with pytest.raises(SpecTokenizationError):
+        spack.spec.Spec(f"x@{mixed}=1.2")
+    assert isinstance(spack.spec.Spec(f"x@{mixed.lower()}").versions[0], spack.version.GitVersion)
+
+
+@pytest.mark.regression("32471")
+@pytest.mark.parametrize("spec_str", ["target=x86_64", "os=redhat6", "target=x86_64:"])
+def test_platform_is_none_if_not_present(spec_str):
+    s = SpecParser(spec_str, Spec).next_spec()
+    assert s.architecture.platform is None, s
+
+
+def test_parse_one_or_raise_error_message():
+    with pytest.raises(ValueError) as exc:
+        parse_one_or_raise("  x y   z", Spec)
+
+    msg = """\
+expected a single spec, but got more:
+  x y   z
+    ^\
+"""
+
+    assert str(exc.value) == msg
+
+    with pytest.raises(ValueError, match="expected a single spec, but got none"):
+        parse_one_or_raise("    ", Spec)
+
+
+@pytest.mark.parametrize(
+    "input_args,expected",
+    [
+        # mpileaks %[virtuals=c deptypes=build] gcc
+        (
+            ["mpileaks", "%[virtuals=c", "deptypes=build]", "gcc"],
+            ["mpileaks %[virtuals=c deptypes=build] gcc"],
+        ),
+        # mpileaks %[ virtuals=c deptypes=build] gcc
+        (
+            ["mpileaks", "%[", "virtuals=c", "deptypes=build]", "gcc"],
+            ["mpileaks %[virtuals=c deptypes=build] gcc"],
+        ),
+        # mpileaks %[ virtuals=c deptypes=build ] gcc
+        (
+            ["mpileaks", "%[", "virtuals=c", "deptypes=build", "]", "gcc"],
+            ["mpileaks %[virtuals=c deptypes=build] gcc"],
+        ),
+    ],
+)
+def test_parse_multiple_edge_attributes(input_args, expected):
+    """Tests that we can parse correctly multiple edge attributes within square brackets,
+    from the command line.
+
+    The input are strings as they would be parsed from argparse.REMAINDER
+    """
+    s, *_ = spack.cmd.parse_specs(input_args)
+    for c in expected:
+        assert s.satisfies(c)
+
+
+def test_when_edge_attribute_keeps_commas():
+    """A when value is one spec string, where a comma is part of the syntax, unlike the
+    comma-separated deptypes and virtuals lists."""
+    edge = spack.spec.Spec("foo ^[when='@1,2'] bar").edges_to_dependencies(name="bar")[0]
+    assert edge.when == spack.spec.Spec("@1,2")
+
+
+def test_repeated_edge_attributes_combine():
+    """An attribute repeated over groups of edge properties combines with the earlier value,
+    instead of replacing it: virtuals accumulate, deptypes are or-ed and conditions constrained."""
+    spec = spack.spec.Spec(
+        "foo ^[virtuals=mpi][deptypes=build][when=+a][virtuals=scalapack][deptypes=link]"
+        "[when=+b] mpich"
+    )
+    edge = spec.edges_to_dependencies(name="mpich")[0]
+    assert edge.virtuals == ("mpi", "scalapack")
+    assert edge.depflag == spack.deptypes.canonicalize(["build", "link"])
+    assert edge.when == spack.spec.Spec("+a+b")
+
+
+def test_edge_property_groups_in_when_condition():
+    """A when condition is a spec, so it can carry groups of edge properties of its own: the
+    closing bracket of the condition is the one that is not reopened."""
+    spec = spack.spec.Spec("foo %[when=^[virtuals=mpi][deptypes=link]mpich][virtuals=c]gcc")
+    edge = spec.edges_to_dependencies(name="gcc")[0]
+    assert edge.virtuals == ("c",)
+    assert edge.when == spack.spec.Spec("^[virtuals=mpi deptypes=link] mpich")
+
+
+@pytest.mark.parametrize(
+    "spec_str,expected",
+    [
+        # square brackets are not valid characters in an unquoted value
+        ("a=']'", "a=']'"),
+        ("a='['", "a='['"),
+        # an anonymous dependency is named * only where its options could be read as a name
+        ("foo ^", "foo ^*"),
+        ("pkg-a %*+foo ^*@1.0", "pkg-a %+foo ^@1.0"),
+        ("^cflags=-O2", "^* cflags=-O2"),
+        # a virtual assignment is one token, the node options follow
+        ("zlib % c=gcc", "zlib %c=gcc"),
+        ("^mpi=intel-parallel-studio+mkl", "^mpi=intel-parallel-studio+mkl"),
+        ("%c=builtin.gcc@14", "%c=builtin.gcc@14"),
+        # virtuals of an anonymous spec stay in the edge attributes, there is no name to
+        # substitute them with
+        ("%[virtuals=c] *", "%[virtuals=c] *"),
+        ("%[deptypes=build virtuals=c] *", "%[deptypes=build virtuals=c] *"),
+        ("^[virtuals=c,cxx] *", "^[virtuals=c,cxx] *"),
+        ("%[virtuals=c] *@4.0 foo=bar", "%[virtuals=c] @4.0 foo=bar"),
+        # a star is a package name, so name=* is a variant value, not a substitute
+        ("^dev_path=*", "^* dev_path='*'"),
+        # a when= value is a spec, which extends to the closing bracket and is printed unquoted
+        ("%[when=a=*]", "%[when=a='*'] *"),
+        ("""x %[when="a=']'"] gcc""", "x %[when=a=']'] gcc"),
+        ("foo ^[when=bar virtuals=c] baz", "foo ^[when=bar virtuals=c] baz"),
+        ("foo when=bar", "foo when=bar"),
+        # a quoted when= is a value like any other, so it can precede other edge attributes
+        ("foo ^[when='+x' virtuals=c] bar", "foo ^[when=+x] c=bar"),
+        ('foo ^[when="+x" virtuals=c] bar', "foo ^[when=+x] c=bar"),
+        ("foo ^[when='+x']c=bar", "foo ^[when=+x] c=bar"),
+        # repeated edge attributes combine: conditions are constrained, like virtuals accumulate
+        ("x ^[when='+a' when='+b'] y", "x ^[when=+a+b] y"),
+        ("%[when='@1,2' virtuals=c] *", "%[virtuals=c when=@1:2] *"),
+        ("%[virtuals=c when=@1,2] *", "%[virtuals=c when=@1:2] *"),
+        ("%[deptypes=build virtuals=c when=@1,2] *", "%[deptypes=build virtuals=c when=@1:2] *"),
+        ("x %[when=%c=gcc] y", "x %[when=%c=gcc] y"),
+        # a version bound is never truncated at a "." to make room for a key=value pair
+        ("@:a.a=''", "a.a=''"),
+        ("@1.2:2.0=x", "@1.2: 2.0=x"),
+        # there is no escaping in quoted values: a backslash is a character like any other, and a
+        # value that contains one kind of quote is quoted with the other
+        (r"a='x\' b='y'", r"a='x\' b=y"),
+        (r"""a="it's\"""", r"""a="it's\""""),
+        # nor is there json-style escaping of non-ASCII or control characters on output
+        ('a="café\'s"', 'a="café\'s"'),
+        ('a="x\'\ty"', 'a="x\'\ty"'),
+        # a key=value pair after a sigil is a virtual assignment only if the whole value is a
+        # package name, otherwise it is a variant of an anonymous dependency
+        ("^foo=bar:baz", "^* foo='bar:baz'"),
+        ("^foo=bar,baz", "^* foo=bar,baz"),
+        ("^foo=bar=baz", "^* foo='bar=baz'"),
+        ("%x=y~", "%* x='y~'"),
+    ],
+)
+def test_spec_str_round_trips(spec_str, expected):
+    """The string of a spec must be parseable, and parse back to the same spec."""
+    spec = spack.spec.Spec(spec_str)
+    assert str(spec) == expected
+    assert spack.spec.Spec(str(spec)) == spec
+
+
+@pytest.mark.regression("52375")
+def test_external_spec_hash_can_be_looked_up(config, mock_packages):
+    """Tests that the hash of an external can be successfully looked up."""
+    packages_yaml = config.deepcopy_as_builtin("packages")
+    externals_dict = extract_dicts_from_configuration(packages_yaml)
+    parser = ExternalSpecsParser(
+        externals_dict, repo=mock_packages, complete_node=complete_variants_and_architecture
+    )
+    abstract_hashes = [f"{x.name}/{x.dag_hash()[:5]}" for x in parser.all_specs()]
+
+    assert all(spack.hash_lookup.lookup_hash(spack.spec.Spec(x)) for x in abstract_hashes)
+
+
+def test_parser_constructs_nodes_of_given_class():
+    class SpecSubclass(Spec):
+        pass
+
+    spec = SpecParser("a ^b %[when=+x] c %[when='@1'] d", SpecSubclass).next_spec()
+    edges = list(spec.traverse_edges(root=False))
+    assert [type(e.spec) for e in edges] == [SpecSubclass] * 3
+    assert [type(e.when) for e in edges if e.when is not EMPTY_SPEC] == [SpecSubclass] * 2

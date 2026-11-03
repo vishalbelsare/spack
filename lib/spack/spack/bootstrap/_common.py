@@ -1,0 +1,222 @@
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
+#
+# SPDX-License-Identifier: (Apache-2.0 OR MIT)
+"""Common basic functions used through the spack.bootstrap package"""
+
+import fnmatch
+import glob
+import importlib
+import os
+import re
+import sys
+import sysconfig
+import warnings
+from typing import NamedTuple, Optional, Sequence, Union
+
+import spack.vendor.archspec.cpu
+
+import spack.platforms
+import spack.spec
+import spack.store
+import spack.util.environment
+import spack.util.executable
+import spack.util.filesystem as fs
+from spack.util import tty
+
+from .config import spec_for_current_python
+
+
+class ExecutableInfo(NamedTuple):
+    """An executable found in the bootstrap store, and the spec that provides it."""
+
+    spec: spack.spec.Spec
+    command: spack.util.executable.Executable
+
+
+def _python_import(module: str) -> bool:
+    try:
+        importlib.import_module(module)
+    except ImportError:
+        return False
+    return True
+
+
+def _try_import_from_store(module: str, query_spec: Union[str, "spack.spec.Spec"]) -> bool:
+    """Return True if the module can be imported from an already
+    installed spec, False otherwise.
+
+    Args:
+        module: Python module to be imported
+        query_spec: spec that may provide the module
+    """
+    # If it is a string assume it's one of the root specs by this module
+    if isinstance(query_spec, str):
+        # We have to run as part of this python interpreter
+        query_spec += " ^" + spec_for_current_python()
+
+    installed_specs = spack.store.STORE.db.query(query_spec, installed=True)
+
+    for candidate_spec in installed_specs:
+        # previously bootstrapped specs may not have a python-venv dependency.
+        if candidate_spec.dependencies("python-venv"):
+            python, *_ = candidate_spec.dependencies("python-venv")
+        else:
+            python, *_ = candidate_spec.dependencies("python")
+
+        # if python is installed, ask it for the layout
+        if spack.store.STORE.db.installed(python):
+            module_paths = [
+                os.path.join(candidate_spec.prefix, python.package.purelib),
+                os.path.join(candidate_spec.prefix, python.package.platlib),
+            ]
+        # otherwise search for the site-packages directory
+        # (clingo from binaries with truncated python-venv runtime)
+        else:
+            module_paths = glob.glob(
+                os.path.join(candidate_spec.prefix, "lib", "python*", "site-packages")
+            )
+        path_before = list(sys.path)
+
+        # NOTE: try module_paths first and last, last allows an existing version in path
+        # to be picked up and used, possibly depending on something in the store, first
+        # allows the bootstrap version to work when an incompatible version is in
+        # sys.path
+        orders = [module_paths + sys.path, sys.path + module_paths]
+        for path in orders:
+            sys.path = path
+            try:
+                _fix_ext_suffix(candidate_spec)
+                if _python_import(module):
+                    msg = (
+                        f"[BOOTSTRAP MODULE {module}] The installed spec "
+                        f'"{query_spec}/{candidate_spec.dag_hash()}" '
+                        f'provides the "{module}" Python module'
+                    )
+                    tty.debug(msg)
+                    return True
+            except Exception as exc:  # pylint: disable=broad-except
+                msg = (
+                    "unexpected error while trying to import module "
+                    f'"{module}" from spec "{candidate_spec}" [error="{str(exc)}"]'
+                )
+                warnings.warn(msg)
+            else:
+                msg = "Spec {0} did not provide module {1}"
+                warnings.warn(msg.format(candidate_spec, module))
+
+        sys.path = path_before
+
+    return False
+
+
+def _fix_ext_suffix(candidate_spec: "spack.spec.Spec"):
+    """Fix the external suffixes of Python extensions on the fly for
+    platforms that may need it
+
+    Args:
+        candidate_spec (Spec): installed spec with a Python module
+            to be checked.
+    """
+    # Here we map target families to the patterns expected
+    # by pristine CPython. Only architectures with known issues
+    # are included. Known issues:
+    #
+    # [RHEL + ppc64le]: https://github.com/spack/spack/issues/25734
+    #
+    _suffix_to_be_checked = {
+        "ppc64le": {
+            "glob": "*.cpython-*-powerpc64le-linux-gnu.so",
+            "re": r".cpython-[\w]*-powerpc64le-linux-gnu.so",
+            "fmt": r"{module}.cpython-{major}{minor}m-powerpc64le-linux-gnu.so",
+        }
+    }
+
+    # If the current architecture is not problematic return
+    generic_target = spack.vendor.archspec.cpu.host().family
+    if str(generic_target) not in _suffix_to_be_checked:
+        return
+
+    # If there's no EXT_SUFFIX (Python < 3.5) or the suffix matches
+    # the expectations, return since the package is surely good
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if ext_suffix is None:
+        return
+
+    expected = _suffix_to_be_checked[str(generic_target)]
+    if fnmatch.fnmatch(ext_suffix, expected["glob"]):
+        return
+
+    # If we are here it means the current interpreter expects different names
+    # than pristine CPython. So:
+    # 1. Find what we have installed
+    # 2. Create symbolic links for the other names, it they're not there already
+
+    # Check if standard names are installed and if we have to create
+    # link for this interpreter
+    standard_extensions = fs.find(candidate_spec.prefix, expected["glob"])
+    link_names = [re.sub(expected["re"], ext_suffix, s) for s in standard_extensions]
+    for file_name, link_name in zip(standard_extensions, link_names):
+        if os.path.exists(link_name):
+            continue
+        os.symlink(file_name, link_name)
+
+    # Check if this interpreter installed something and we have to create
+    # links for a standard CPython interpreter
+    non_standard_extensions = fs.find(candidate_spec.prefix, "*" + ext_suffix)
+    for abs_path in non_standard_extensions:
+        directory, filename = os.path.split(abs_path)
+        module = filename.split(".")[0]
+        link_name = os.path.join(
+            directory,
+            expected["fmt"].format(
+                module=module, major=sys.version_info[0], minor=sys.version_info[1]
+            ),
+        )
+        if os.path.exists(link_name):
+            continue
+        os.symlink(abs_path, link_name)
+
+
+def _executables_in_store(
+    executables: Sequence[str], query_spec: Union["spack.spec.Spec", str]
+) -> Optional[ExecutableInfo]:
+    """Return the first of the executables that can be retrieved from a spec in the
+    store, together with the spec providing it, or None if there is no such spec.
+
+    The different executables must provide the same functionality and are
+    "alternate" to each other, i.e. the function returns on the first one found.
+
+    Args:
+        executables: list of executables to be searched
+        query_spec: spec that may provide the executable
+    """
+    executables_str = ", ".join(executables)
+    msg = "[BOOTSTRAP EXECUTABLES {0}] Try installed specs with query '{1}'"
+    tty.debug(msg.format(executables_str, query_spec))
+    for concrete_spec in spack.store.STORE.db.query(query_spec, installed=True):
+        bin_dir = concrete_spec.prefix.bin
+        command = spack.util.executable.which(*executables, path=bin_dir)
+        if command is None:
+            continue
+        spack.util.environment.path_put_first("PATH", [bin_dir])
+        return ExecutableInfo(spec=concrete_spec, command=command)
+    return None
+
+
+def _root_spec(spec_str: str, platform: Optional[str] = None, target: Optional[str] = None) -> str:
+    """Add the platform and target to a spec used during bootstrapping.
+
+    Args:
+        spec_str: spec to be bootstrapped. Must be without platform and target.
+        platform: platform the software will run on. Defaults to the host platform.
+        target: target family the software will run on. Defaults to the host target family.
+    """
+    if platform is None:
+        platform = str(spack.platforms.host())
+    if target is None:
+        target = str(spack.vendor.archspec.cpu.host().family)
+
+    spec_str += f" platform={platform} target={target}"
+
+    tty.debug(f"[BOOTSTRAP ROOT SPEC] {spec_str}")
+    return spec_str

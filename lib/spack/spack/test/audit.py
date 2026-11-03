@@ -1,85 +1,146 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import pytest
 
 import spack.audit
-import spack.config
+from spack.config import Configuration
 
 
-@pytest.mark.parametrize('packages,failing_check', [
-    # A non existing variant is used in a conflict directive
-    (['wrong-variant-in-conflicts'], 'PKG-DIRECTIVES'),
-    # The package declares a non-existing dependency
-    (['missing-dependency'], 'PKG-DIRECTIVES'),
-    # The package use a non existing variant in a depends_on directive
-    (['wrong-variant-in-depends-on'], 'PKG-DIRECTIVES'),
-    # This package has no issues
-    (['mpileaks'], None)
-])
-def test_package_audits(packages, failing_check, mock_packages):
-    reports = spack.audit.run_group('packages', pkgs=packages)
+@pytest.mark.parametrize(
+    # PKG-PROPERTIES are ubiquitous in mock packages, since they don't use sha256
+    # and they don't change the example.com URL very often.
+    "packages,expected_errors",
+    [
+        # A non existing variant is used in a conflict directive
+        (["wrong-variant-in-conflicts"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # The package declares a non-existing dependency
+        (["missing-dependency"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # The package use a non existing variant in a depends_on directive
+        (["wrong-variant-in-depends-on"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # This package has a GitHub pull request commit patch URL
+        (["invalid-github-pull-commits-patch-url"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # This package has a GitHub patch URL without full_index=1
+        (["invalid-github-patch-url"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # This package has invalid GitLab patch URLs
+        (["invalid-gitlab-patch-url"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # This package has invalid GitLab patch URLs
+        (["invalid-selfhosted-gitlab-patch-url"], ["PKG-DIRECTIVES", "PKG-PROPERTIES"]),
+        # This package has a stand-alone test method in build-time callbacks
+        (["fail-test-audit"], ["PKG-PROPERTIES"]),
+        # This package has stand-alone test methods without non-trivial docstrings
+        (["fail-test-audit-docstring"], ["PKG-PROPERTIES"]),
+        # This package has a stand-alone test method without an implementation
+        (["fail-test-audit-impl"], ["PKG-PROPERTIES"]),
+        # This package doesn't inherit from a package that creates a builder
+        (["fail-test-audit-builder"], ["PKG-PROPERTIES"]),
+        # This package has maintainers with placeholders
+        (["invalid-maintainer"], ["PKG-DIRECTIVES"]),
+        # This package has no issues
+        (["mpileaks"], None),
+        # This package has a conflict with a trigger which cannot constrain the constraint
+        # Should not raise an error
+        (["unconstrainable-conflict"], None),
+    ],
+)
+def test_package_audits(packages, expected_errors, mock_packages):
+    reports = spack.audit.run_group("packages", pkgs=packages)
 
-    for check, errors in reports:
-        # Check that we have errors only if there is an expected failure
-        # and that the tag matches our expectations
-        if bool(failing_check):
-            assert check == failing_check
-            assert errors
-        else:
-            assert not errors
-
-
-# Data used in the test below to audit the double definition of a compiler
-_double_compiler_definition = [
-    {'compiler': {
-        'spec': 'gcc@9.0.1',
-        'paths': {
-            'cc': '/usr/bin/gcc-9',
-            'cxx': '/usr/bin/g++-9',
-            'f77': '/usr/bin/gfortran-9',
-            'fc': '/usr/bin/gfortran-9'
-        },
-        'flags': {},
-        'operating_system': 'ubuntu18.04',
-        'target': 'x86_64',
-        'modules': [],
-        'environment': {},
-        'extra_rpaths': []
-    }},
-    {'compiler': {
-        'spec': 'gcc@9.0.1',
-        'paths': {
-            'cc': '/usr/bin/gcc-9',
-            'cxx': '/usr/bin/g++-9',
-            'f77': '/usr/bin/gfortran-9',
-            'fc': '/usr/bin/gfortran-9'
-        },
-        'flags': {"cflags": "-O3"},
-        'operating_system': 'ubuntu18.04',
-        'target': 'x86_64',
-        'modules': [],
-        'environment': {},
-        'extra_rpaths': []
-    }}
-]
+    # Check that errors were reported only for the expected failure
+    actual_errors = [check for check, errors in reports if errors]
+    msg = "\n".join([str(e) for _, errors in reports for e in errors])
+    if expected_errors:
+        assert expected_errors == actual_errors, msg
+    else:
+        assert not actual_errors, msg
 
 
-@pytest.mark.parametrize('config_section,data,failing_check', [
-    # Double compiler definitions in compilers.yaml
-    ('compilers', _double_compiler_definition, 'CFG-COMPILER'),
-    # Multiple definitions of the same external spec in packages.yaml
-    ('packages', {
-        "mpileaks": {"externals": [
-            {"spec": "mpileaks@1.0.0", "prefix": "/"},
-            {"spec": "mpileaks@1.0.0", "prefix": "/usr"},
-        ]}
-    }, 'CFG-PACKAGES')
-])
-def test_config_audits(config_section, data, failing_check):
-    with spack.config.override(config_section, data):
-        reports = spack.audit.run_group('configs')
-        assert any(
-            (check == failing_check) and errors for check, errors in reports
-        )
+# TODO/RepoSplit: Should this not rely on mock packages post split?
+@pytest.mark.parametrize(
+    "config_section,data,failing_check",
+    [
+        # Multiple definitions of the same external spec in packages.yaml
+        (
+            "packages",
+            {
+                "mpileaks": {
+                    "externals": [
+                        {"spec": "mpileaks@1.0.0", "prefix": "/"},
+                        {"spec": "mpileaks@1.0.0", "prefix": "/usr"},
+                    ]
+                }
+            },
+            "CFG-PACKAGES",
+        ),
+        # A template set for some of the installations folded in a tcl module file
+        (
+            "modules",
+            {
+                "default": {
+                    "tcl": {
+                        "variants": "all",
+                        "hash_length": 0,
+                        "mpileaks +debug": {"template": "override_from_modules.txt"},
+                    }
+                }
+            },
+            "CFG-MODULES",
+        ),
+    ],
+)
+def test_config_audits(
+    mutable_config: Configuration, config_section, data, failing_check, mock_packages
+):
+    with mutable_config.override(config_section, data):
+        reports = spack.audit.run_group("configs")
+        assert any((check == failing_check) and errors for check, errors in reports)
+
+
+@pytest.mark.parametrize(
+    "tcl_data",
+    [
+        # A template set for a package or a package version applies to the whole module file
+        {"variants": "all", "hash_length": 0, "mpileaks": {"template": "override.txt"}},
+        {"variants": "all", "hash_length": 0, "mpileaks@2.3": {"template": "override.txt"}},
+        {"variants": "all", "hash_length": 0, "all": {"template": "override.txt"}},
+        # Installations are not folded when variants are not defined in module files
+        {"mpileaks +debug": {"template": "override.txt"}},
+    ],
+)
+def test_modules_audit_accepts_templates(mutable_config: Configuration, tcl_data, mock_packages):
+    with mutable_config.override("modules", {"default": {"tcl": tcl_data}}):
+        assert not spack.audit.run_check("CFG-MODULES")
+
+
+def test_when_combined_with_phase_callbacks(mock_packages):
+    """Ensure @when on a method decorated with @run_before or @run_after is reported"""
+    errors = spack.audit.run_check("PKG-PROPERTIES", pkgs=["fail-test-audit-when-callback"])
+    details = [d for e in errors for d in e.details]
+    assert any(
+        "'callback_outside' is decorated with both @when and @run_before" in d for d in details
+    )
+    assert any(
+        "'callback_inside' is decorated with both @when and @run_after" in d for d in details
+    )
+
+
+@pytest.mark.parametrize(
+    "package,expected",
+    [
+        (
+            "patch-fixes-unknown-label",
+            [
+                "patch-fixes-unknown-label: patch 'cve.patch' fixes 'CVE-2026-9999', which is not "
+                "a label of any deprecated() directive of 'patch-fixes-unknown-label'"
+            ],
+        ),
+        ("deprecated-patched", []),
+        ("patches-deprecated-dep", []),
+    ],
+)
+def test_audit_reports_patch_fixes_naming_no_deprecation_label(package, expected, mock_packages):
+    """Tests that a label in patch(fixes=...) must be a label of a deprecated() directive of the
+    patched package, and that a correct one on a dependency is not reported.
+    """
+    errors = spack.audit.run_check("PKG-DIRECTIVES", pkgs=[package])
+    assert [e.summary for e in errors] == expected

@@ -1,14 +1,13 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 from spack.main import print_setup_info
 
 
-def test_print_shell_vars_sh(capsys):
-    print_setup_info('sh')
-    out, _ = capsys.readouterr()
+def test_print_shell_vars_sh(capfd):
+    print_setup_info("sh")
+    out, _ = capfd.readouterr()
 
     assert "_sp_sys_type=" in out
     assert "_sp_tcl_roots=" in out
@@ -16,31 +15,11 @@ def test_print_shell_vars_sh(capsys):
     assert "_sp_module_prefix" not in out
 
 
-def test_print_shell_vars_csh(capsys):
-    print_setup_info('csh')
-    out, _ = capsys.readouterr()
+def test_print_shell_vars_csh(capfd):
+    print_setup_info("csh")
+    out, _ = capfd.readouterr()
 
     assert "set _sp_sys_type = " in out
     assert "set _sp_tcl_roots = " in out
     assert "set _sp_lmod_roots = " in out
     assert "set _sp_module_prefix = " not in out
-
-
-def test_print_shell_vars_sh_modules(capsys):
-    print_setup_info('sh', 'modules')
-    out, _ = capsys.readouterr()
-
-    assert "_sp_sys_type=" in out
-    assert "_sp_tcl_roots=" in out
-    assert "_sp_lmod_roots=" in out
-    assert "_sp_module_prefix=" in out
-
-
-def test_print_shell_vars_csh_modules(capsys):
-    print_setup_info('csh', 'modules')
-    out, _ = capsys.readouterr()
-
-    assert "set _sp_sys_type = " in out
-    assert "set _sp_tcl_roots = " in out
-    assert "set _sp_lmod_roots = " in out
-    assert "set _sp_module_prefix = " in out

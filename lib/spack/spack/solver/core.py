@@ -1,0 +1,175 @@
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
+#
+# SPDX-License-Identifier: (Apache-2.0 OR MIT)
+"""Basic data structures used to build Spack's ASP program"""
+
+from typing import Any, Dict, NamedTuple, Optional, Tuple
+
+from spack.util import lang
+
+#: Type used for quoted string cache
+QuotedStrings = Dict[str, str]
+
+
+class AspVar:
+    """Represents a variable in an ASP rule, allows for conditionally generating
+    rules"""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __str__(self) -> str:
+        return str(self.name)
+
+
+@lang.key_ordering
+class AspFunction:
+    """A term in the ASP logic program"""
+
+    __slots__ = ("name", "args")
+
+    def __init__(self, name: str, args: Tuple[Any, ...] = ()) -> None:
+        self.name = name
+        self.args = args
+
+    def _cmp_key(self) -> Tuple[str, Tuple[Any, ...]]:
+        return self.name, self.args
+
+    def __call__(self, *args: Any) -> "AspFunction":
+        """Return a new instance of this function with added arguments.
+
+        Note that calls are additive, so you can do things like::
+
+            >>> attr = AspFunction("attr")
+            attr()
+
+            >>> attr("version")
+            attr("version")
+
+            >>> attr("version")("foo")
+            attr("version", "foo")
+
+            >>> v = AspFunction("attr", "version")
+            attr("version")
+
+            >>> v("foo", "bar")
+            attr("version", "foo", "bar")
+
+        """
+        return AspFunction(self.name, args if not self.args else self.args + args)
+
+    def __str__(self) -> str:
+        return self.to_str({})
+
+    def to_str(self, quoted: QuotedStrings) -> str:
+        """The ASP representation of this function, reusing the literals in ``quoted``."""
+        args = self.args
+        # nearly every function takes one or two arguments; those need neither list nor join
+        if len(args) == 1:
+            return f"{self.name}({asp_argument(args[0], quoted)})"
+        if len(args) == 2:
+            return f"{self.name}({asp_argument(args[0], quoted)},{asp_argument(args[1], quoted)})"
+        return f"{self.name}({','.join([asp_argument(arg, quoted) for arg in args])})"
+
+    def args_str(self, quoted: QuotedStrings) -> str:
+        """The arguments as they appear between the parentheses of this function."""
+        return ",".join([asp_argument(arg, quoted) for arg in self.args])
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+def quote(arg: str, quoted: QuotedStrings) -> str:
+    """The ASP literal for the string ``arg``: escaped, in double quotes, and kept for reuse."""
+    return quoted.get(arg) or _quote(arg, quoted)
+
+
+def quote_once(arg: str) -> str:
+    """The ASP literal for a string that is not expected to come up again."""
+    return '"' + arg.replace("\\", r"\\").replace("\n", r"\n").replace('"', r"\"") + '"'
+
+
+#: Constant that determines the maximum length of a string that's kept in the quoted cache
+MAX_QUOTED_LENGTH = 32
+
+
+def _quote(arg: str, quoted: QuotedStrings) -> str:
+    """Compute the ASP literal for ``arg``, and keep it if it is short; see :func:`quote`."""
+    result = quote_once(arg)
+    if len(arg) <= MAX_QUOTED_LENGTH:
+        quoted[arg] = result
+    return result
+
+
+def asp_argument(arg: Any, quoted: QuotedStrings) -> str:
+    """The ASP representation of a single argument of a function."""
+    # exact type checks first, ordered by frequency
+    if type(arg) is str:
+        return quoted.get(arg) or _quote(arg, quoted)
+    if type(arg) is AspFunction:
+        return arg.to_str(quoted)
+    if type(arg) is int or type(arg) is AspVar:
+        return str(arg)
+    # subclasses miss the checks above: config values are syaml_str / syaml_int. bool is
+    # an int subclass, but is not a number in ASP, so it is quoted below.
+    if isinstance(arg, int) and not isinstance(arg, bool):
+        return str(arg)
+    if isinstance(arg, str):
+        return quoted.get(arg) or _quote(arg, quoted)
+    return f'"{arg}"'
+
+
+class _AspFunctionBuilder:
+    def __getattr__(self, name: str) -> AspFunction:
+        # Writing to __dict__ directly caches the result so repeated access to the
+        # same name bypasses __getattr__ and hits the instance dict instead.
+        # Safe because AspFunction objects are never mutated.
+        f = AspFunction(name)
+        self.__dict__[name] = f
+        return f
+
+
+#: Global AspFunction builder
+fn = _AspFunctionBuilder()
+
+
+class NodeId(NamedTuple):
+    """Represents a node in the DAG"""
+
+    id: str
+    pkg: str
+
+
+def min_dupe_node(*, pkg: str) -> NodeId:
+    """Given a package name, returns the "min_dupe_id" node in the ASP encoding.
+
+    Args:
+        pkg: name of a package
+    """
+    return NodeId(id="0", pkg=pkg)
+
+
+class NodeFlag(NamedTuple):
+    flag_type: str
+    flag: str
+    flag_group: str
+    source: str
+
+
+class SourceContext:
+    """Tracks context in which a Spec's clause-set is generated (i.e.
+    with ``SpecClauseGenerator.spec_clauses``).
+
+    Facts generated for the spec may include this context.
+    """
+
+    def __init__(self, *, source: Optional[str] = None):
+        # This can be "literal" for constraints that come from a user
+        # spec (e.g. from the command line); it can be the output of
+        # `ConstraintOrigin.append_type_suffix`; the default is "none"
+        # (which means it isn't important to keep track of the source
+        # in that case).
+        self.source = "none" if source is None else source
+        self.wrap_node_requirement: Optional[bool] = None

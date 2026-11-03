@@ -1,64 +1,99 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import argparse
+import collections
+import io
 import sys
+import warnings
 
-import llnl.util.tty as tty
-
-from spack.util.log_parse import make_log_context, parse_log_events
+from spack.util.ctest_log_parser import Severity
+from spack.util.log_parse import scan_log, write_block
 
 description = "filter errors and warnings from build logs"
-section = "build"
+section = "developer"
 level = "long"
 
-event_types = ('errors', 'warnings')
+event_types = ("errors", "warnings")
 
 
-def setup_parser(subparser):
+def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
-        '--show', action='store', default='errors',
-        help="comma-separated list of what to show; options: errors, warnings")
+        "--show",
+        action="store",
+        default="errors",
+        help="comma-separated list of what to show; options: errors, warnings",
+    )
     subparser.add_argument(
-        '-c', '--context', action='store', type=int, default=3,
-        help="lines of context to show around lines of interest")
+        "-c",
+        "--context",
+        action="store",
+        type=int,
+        default=3,
+        help="lines of context to show around lines of interest",
+    )
     subparser.add_argument(
-        '-p', '--profile', action='store_true',
-        help="print out a profile of time spent in regexes during parse")
+        "-p",
+        "--profile",
+        action="store_true",
+        help="print out a profile of time spent in regexes during parse",
+    )
     subparser.add_argument(
-        '-w', '--width', action='store', type=int, default=None,
-        help="wrap width: auto-size to terminal by default; 0 for no wrap")
+        "-w", "--width", action="store", type=int, default=None, help=argparse.SUPPRESS
+    )
     subparser.add_argument(
-        '-j', '--jobs', action='store', type=int, default=None,
-        help="number of jobs to parse log file (default: 1 for short logs, "
-        "ncpus for long logs)")
+        "-j", "--jobs", action="store", type=int, default=None, help=argparse.SUPPRESS
+    )
+    subparser.add_argument(
+        "-t",
+        "--tail",
+        metavar="LINES",
+        action="store",
+        type=int,
+        default=0,
+        help="number of trailing log lines to show (0 to disable)",
+    )
 
-    subparser.add_argument(
-        'file', help="a log file containing build output, or - for stdin")
+    subparser.add_argument("file", help="a log file containing build output, or - for stdin")
 
 
 def log_parse(parser, args):
     input = args.file
-    if args.file == '-':
-        input = sys.stdin
+    if args.file == "-":
+        input = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
 
-    errors, warnings = parse_log_events(
-        input, args.context, args.jobs, args.profile)
-    if args.profile:
-        return
+    if args.width is not None:
+        warnings.warn("The --width option is deprecated and will be removed in Spack v1.3")
+    if args.jobs is not None:
+        warnings.warn("The --jobs option is deprecated and will be removed in Spack v1.3")
 
-    types = [s.strip() for s in args.show.split(',')]
+    types = [s.strip() for s in args.show.split(",")]
     for e in types:
         if e not in event_types:
-            tty.die('Invalid event type: %s' % e)
+            args.subparser.error("invalid event type: %s" % e)
 
-    events = []
-    if 'errors' in types:
-        events.extend(errors)
-        print('%d errors' % len(errors))
-    if 'warnings' in types:
-        events.extend(warnings)
-        print('%d warnings' % len(warnings))
+    severities = set()
+    if "errors" in types:
+        severities.add(Severity.ERROR)
+    if "warnings" in types:
+        severities.add(Severity.WARNING)
 
-    print(make_log_context(events, args.width))
+    blocks = scan_log(input, args.context, args.tail, severities, args.profile)
+
+    if args.profile:
+        # Consume the scan so the parser gets to print its timings, but show nothing else.
+        for _ in blocks:
+            pass
+        return
+
+    # Write the log as it is scanned, so the counts can only be reported afterwards.
+    counts = collections.Counter()
+    for block in blocks:
+        write_block(sys.stdout, block)
+        counts.update(match.severity for match in block.matches.values())
+
+    if "errors" in types:
+        print("%d errors" % counts[Severity.ERROR])
+    if "warnings" in types:
+        print("%d warnings" % counts[Severity.WARNING])

@@ -1,5 +1,4 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -41,16 +40,16 @@
 
 # prevent infinite recursion when spack shells out (e.g., on cray for modules)
 if [ -n "${_sp_initializing:-}" ]; then
-    exit 0
+    return 0
 fi
 export _sp_initializing=true
 
 
 _spack_shell_wrapper() {
-    # Store LD_LIBRARY_PATH variables from spack shell function
+    # Store DYLD_* variables from spack shell function
     # This is necessary because MacOS System Integrity Protection clears
     # variables that affect dyld on process start.
-    for var in LD_LIBRARY_PATH DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH; do
+    for var in DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH; do
         eval "if [ -n \"\${${var}-}\" ]; then export SPACK_$var=\${${var}}; fi"
     done
 
@@ -98,7 +97,7 @@ _spack_shell_wrapper() {
             if [ "$_sp_arg" = "-h" ] || [ "$_sp_arg" = "--help" ]; then
                 command spack cd -h
             else
-                LOC="$(spack location $_sp_arg "$@")"
+                LOC="$(SPACK_COLOR="${SPACK_COLOR:-always}" spack location $_sp_arg "$@")"
                 if [ -d "$LOC" ] ; then
                     cd "$LOC"
                 else
@@ -120,14 +119,13 @@ _spack_shell_wrapper() {
                 case $_sp_arg in
                     activate)
                         # Get --sh, --csh, or -h/--help arguments.
-                        # Space needed here becauses regexes start with a space
+                        # Space needed here because regexes start with a space
                         # and `-h` may be the only argument.
                         _a=" $@"
                         # Space needed here to differentiate between `-h`
                         # argument and environments with "-h" in the name.
                         # Also see: https://www.gnu.org/software/bash/manual/html_node/Shell-Parameter-Expansion.html#Shell-Parameter-Expansion
-                        if [ -z ${1+x} ] || \
-                           [ "${_a#* --sh}" != "$_a" ] || \
+                        if [ "${_a#* --sh}" != "$_a" ] || \
                            [ "${_a#* --csh}" != "$_a" ] || \
                            [ "${_a#* -h}" != "$_a" ] || \
                            [ "${_a#* --help}" != "$_a" ];
@@ -136,13 +134,13 @@ _spack_shell_wrapper() {
                             command spack env activate "$@"
                         else
                             # Actual call to activate: source the output.
-                            stdout="$(command spack $_sp_flags env activate --sh "$@")" || return
+                            stdout="$(SPACK_COLOR="${SPACK_COLOR:-always}" command spack $_sp_flags env activate --sh "$@")" || return
                             eval "$stdout"
                         fi
                         ;;
                     deactivate)
                         # Get --sh, --csh, or -h/--help arguments.
-                        # Space needed here becauses regexes start with a space
+                        # Space needed here because regexes start with a space
                         # and `-h` may be the only argument.
                         _a=" $@"
                         # Space needed here to differentiate between `--sh`
@@ -158,7 +156,7 @@ _spack_shell_wrapper() {
                             command spack env deactivate -h
                         else
                             # No args: source the output of the command.
-                            stdout="$(command spack $_sp_flags env deactivate --sh)" || return
+                            stdout="$(SPACK_COLOR="${SPACK_COLOR:-always}" command spack $_sp_flags env deactivate --sh)" || return
                             eval "$stdout"
                         fi
                         ;;
@@ -171,7 +169,7 @@ _spack_shell_wrapper() {
             ;;
         "load"|"unload")
             # Get --sh, --csh, -h, or --help arguments.
-            # Space needed here becauses regexes start with a space
+            # Space needed here because regexes start with a space
             # and `-h` may be the only argument.
             _a=" $@"
             # Space needed here to differentiate between `-h`
@@ -186,7 +184,7 @@ _spack_shell_wrapper() {
                 # Args contain --sh, --csh, or -h/--help: just execute.
                 command spack $_sp_flags $_sp_subcommand "$@"
             else
-                stdout="$(command spack $_sp_flags $_sp_subcommand --sh "$@")" || return
+                stdout="$(SPACK_COLOR="${SPACK_COLOR:-always}" command spack $_sp_flags $_sp_subcommand --sh "$@")" || return
                 eval "$stdout"
             fi
             ;;
@@ -215,9 +213,9 @@ _spack_pathadd() {
     # Do the actual prepending here.
     eval "_pa_oldvalue=\${${_pa_varname}:-}"
 
-    _pa_canonical=":$_pa_oldvalue:"
+    _pa_canonical="$_pa_oldvalue:"
     if [ -d "$_pa_new_path" ] && \
-       [ "${_pa_canonical#*:${_pa_new_path}:}" = "${_pa_canonical}" ];
+       [ "${_pa_canonical#$_pa_new_path:}" = "$_pa_canonical" ];
     then
         if [ -n "$_pa_oldvalue" ]; then
             eval "export $_pa_varname=\"$_pa_new_path:$_pa_oldvalue\""
@@ -234,6 +232,10 @@ _spack_determine_shell() {
         # If procfs is present this seems a more reliable
         # way to detect the current shell
         _sp_exe=$(readlink /proc/$$/exe)
+        # Emulation (qemu/rosetta) can have _sp_exe point to the emulator, not the shell
+        case "$_sp_exe" in
+            *qemu*|*rosetta*) _sp_exe=$(cat /proc/$$/comm) ;;
+        esac
         # Shell may contain number, like zsh5 instead of zsh
         basename ${_sp_exe} | tr -d '0123456789'
     elif [ -n "${BASH:-}" ]; then
@@ -307,13 +309,6 @@ else
 fi
 _spack_pathadd PATH "${_sp_prefix%/}/bin"
 
-#
-# Check whether a function of the given name is defined
-#
-_spack_fn_exists() {
-    LANG= type $1 2>&1 | grep -q 'function'
-}
-
 # Define the spack shell function with some informative no-ops, so when users
 # run `which spack`, they see the path to spack and where the function is from.
 eval "spack() {
@@ -337,39 +332,9 @@ for cmd in "${SPACK_PYTHON:-}" python3 python python2; do
     fi
 done
 
-if [ -z "${SPACK_SKIP_MODULES+x}" ]; then
-    need_module="no"
-    if ! _spack_fn_exists use && ! _spack_fn_exists module; then
-        need_module="yes"
-    fi;
-
-    #
-    # make available environment-modules
-    #
-    if [ "${need_module}" = "yes" ]; then
-        eval `spack --print-shell-vars sh,modules`
-
-        # _sp_module_prefix is set by spack --print-sh-vars
-        if [ "${_sp_module_prefix}" != "not_installed" ]; then
-            # activate it!
-            # environment-modules@4: has a bin directory inside its prefix
-            _sp_module_bin="${_sp_module_prefix}/bin"
-            if [ ! -d "${_sp_module_bin}" ]; then
-                # environment-modules@3 has a nested bin directory
-                _sp_module_bin="${_sp_module_prefix}/Modules/bin"
-            fi
-
-            # _sp_module_bin and _sp_shell are evaluated here; the quoted
-            # eval statement and $* are deferred.
-            _sp_cmd="module() { eval \`${_sp_module_bin}/modulecmd ${_sp_shell} \$*\`; }"
-            eval "$_sp_cmd"
-            _spack_pathadd PATH "${_sp_module_bin}"
-        fi;
-    else
-        stdout="$(command spack --print-shell-vars sh)" || return
-        eval "$stdout"
-    fi;
-
+if [ -z "${SPACK_SKIP_MODULES+x}" ] && { type module > /dev/null 2>&1 || type use > /dev/null 2>&1; }; then
+    stdout="$(command spack --print-shell-vars sh)" || return
+    eval "$stdout"
 
     #
     # set module system roots

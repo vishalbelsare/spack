@@ -1,36 +1,39 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-
 """Schema for cdash.yaml configuration file.
 
 .. literalinclude:: ../spack/schema/cdash.py
    :lines: 13-
 """
 
+from typing import Any, Dict
 
 #: Properties for inclusion in other schemas
-properties = {
-    'cdash': {
-        'type': 'object',
-        'additionalProperties': False,
-        'required': ['build-group', 'url', 'project', 'site'],
-        'patternProperties': {
-            r'build-group': {'type': 'string'},
-            r'url': {'type': 'string'},
-            r'project': {'type': 'string'},
-            r'site': {'type': 'string'},
+properties: Dict[str, Any] = {
+    "cdash": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["build-group"],
+        "description": "Configuration for uploading build results to CDash",
+        "properties": {
+            "build-group": {
+                "type": "string",
+                "description": "Unique build group name for this stack",
+            },
+            "url": {"type": "string", "description": "CDash server URL"},
+            "project": {"type": "string", "description": "CDash project name"},
+            "site": {"type": "string", "description": "Site identifier for CDash reporting"},
         },
-    },
+    }
 }
 
 
 #: Full schema with metadata
 schema = {
-    '$schema': 'http://json-schema.org/schema#',
-    'title': 'Spack cdash configuration file schema',
-    'type': 'object',
-    'additionalProperties': False,
-    'properties': properties,
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Spack cdash configuration file schema",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": properties,
 }

@@ -1,7 +1,6 @@
 #!/bin/sh
 #
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -42,7 +41,8 @@ do
     succeeds _spack_completions "${line[@]}" ''
 
     # Test that completion with flags works
-    contains '-h --help' _spack_completions "${line[@]}" -
+    # all commands but spack pkg grep have -h; all have --help
+    contains '--help' _spack_completions "${line[@]}" -
 done <<- EOF
     $(spack commands --aliases --format=subcommands)
 EOF
@@ -60,6 +60,15 @@ contains 'python' _spack_completions spack extensions ''
 contains 'hdf5' _spack_completions spack -d install --jobs 8 ''
 contains 'hdf5' _spack_completions spack install -v ''
 
+title 'Testing alias handling'
+contains 'concretize' _spack_completions spack c
+contains 'concretise' _spack_completions spack c
+contains 'concretize' _spack_completions spack conc
+does_not_contain 'concretise' _spack_completions spack conc
+
+does_not_contain 'concretize' _spack_completions spack isnotacommand
+does_not_contain 'concretize' _spack_completions spack env isnotacommand
+
 # XFAIL: Fails for Python 2.6 because pkg_resources not found?
 #contains 'compilers.py' _spack_completions spack unit-test ''
 
@@ -69,6 +78,16 @@ _test_debug_functions() {
     if [ -n "${ZSH_VERSION:-}" ]; then
         emulate -L sh
     fi
+
+    # Test whether `spack install --verb[] spec` completes to `spack install --verbose spec`
+    COMP_LINE='spack install --verb spec'
+    COMP_POINT=20
+    COMP_WORDS=(spack install --verb spec)
+    COMP_CWORD=2
+    COMP_KEY=9
+    COMP_TYPE=64
+    _bash_completion_spack
+    contains "--verbose" echo "${COMPREPLY[@]}"
 
     # This is a particularly tricky case that involves the following situation:
     #     `spack -d [] install `

@@ -1,179 +1,144 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 """Schema for env.yaml configuration file.
 
 .. literalinclude:: _spack_root/lib/spack/spack/schema/env.py
-   :lines: 36-
+   :lines: 19-
 """
-import warnings
 
-from llnl.util.lang import union_dicts
+import os
+from typing import Any, Dict
 
 import spack.schema.merged
-import spack.schema.packages
-import spack.schema.projections
 
-#: legal first keys in the schema
-keys = ('spack', 'env')
+from .spec_list import spec_list_properties, spec_list_schema
 
-spec_list_schema = {
-    'type': 'array',
-    'default': [],
-    'items': {
-        'anyOf': [
-            {'type': 'object',
-             'additionalProperties': False,
-             'properties': {
-                 'matrix': {
-                     'type': 'array',
-                     'items': {
-                         'type': 'array',
-                         'items': {
-                             'type': 'string',
-                         }
-                     }
-                 },
-                 'exclude': {
-                     'type': 'array',
-                     'items': {
-                         'type': 'string'
-                     }
-                 }
-             }},
-            {'type': 'string'},
-            {'type': 'null'}
-        ]
-    }
+#: Top level key in a manifest file
+TOP_LEVEL_KEY = "spack"
+
+# (DEPRECATED) include concrete entries to be merged under the include key
+include_concrete = {
+    "type": "array",
+    "default": [],
+    "description": "List of paths to other environments. Includes concrete specs "
+    "from their spack.lock files without modifying the source environments. Useful "
+    "for phased deployments where you want to build on existing concrete specs.",
+    "items": {"type": "string"},
 }
 
-projections_scheme = spack.schema.projections.properties['projections']
+group_name_and_deps = {
+    "group": {"type": "string", "description": "Name for this group of specs"},
+    "explicit": {
+        "type": "boolean",
+        "default": True,
+        "description": "When false, specs in this group are installed as implicit "
+        "dependencies and are eligible for garbage collection.",
+    },
+    "needs": {
+        "type": "array",
+        "description": "Groups of specs that are needed by this group",
+        "items": {"type": "string"},
+    },
+    "override": {
+        "type": "object",
+        "description": "Top-most configuration scope for this group of specs",
+        "additionalProperties": False,
+        "properties": {**spack.schema.merged.ref_sections},
+    },
+}
+
+
+properties: Dict[str, Any] = {
+    "spack": {
+        "type": "object",
+        "default": {},
+        "description": "Spack environment configuration, including specs, view, and any other "
+        "config section (config, packages, concretizer, mirrors, etc.)",
+        "additionalProperties": False,
+        "properties": {
+            # merged configuration scope schemas
+            **spack.schema.merged.ref_sections,
+            # extra environment schema properties
+            "specs": {
+                "type": "array",
+                "description": "List of specs to include in the environment, "
+                "supporting both simple specs and matrix configurations",
+                "default": [],
+                "items": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "description": "Matrix configuration for generating multiple specs"
+                            " from combinations of constraints",
+                            "additionalProperties": False,
+                            "properties": {**spec_list_properties},
+                        },
+                        {"type": "string", "description": "Simple spec string"},
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "description": "User spec group with a single matrix",
+                            "additionalProperties": False,
+                            "properties": {**spec_list_properties, **group_name_and_deps},
+                        },
+                        {
+                            "type": "object",
+                            "description": "User spec group with multiple matrices",
+                            "additionalProperties": False,
+                            "properties": {**group_name_and_deps, "specs": spec_list_schema},
+                        },
+                    ]
+                },
+            },
+            # (DEPRECATED) include concrete to be merged under the include key
+            "include_concrete": include_concrete,
+            **spack.schema.merged.removed_sections,
+        },
+        "deprecatedProperties": spack.schema.merged.removed_sections_errors,
+    }
+}
 
 schema = {
-    '$schema': 'http://json-schema.org/schema#',
-    'title': 'Spack environment file schema',
-    'type': 'object',
-    'additionalProperties': False,
-    'patternProperties': {
-        '^env|spack$': {
-            'type': 'object',
-            'default': {},
-            'additionalProperties': False,
-            'properties': union_dicts(
-                # merged configuration scope schemas
-                spack.schema.merged.properties,
-                # extra environment schema properties
-                {
-                    'include': {
-                        'type': 'array',
-                        'default': [],
-                        'items': {
-                            'type': 'string'
-                        },
-                    },
-                    'develop': {
-                        'type': 'object',
-                        'default': {},
-                        'additionalProperties': False,
-                        'patternProperties': {
-                            r'\w[\w-]*': {
-                                'type': 'object',
-                                'additionalProperties': False,
-                                'properties': {
-                                    'spec': {
-                                        'type': 'string'
-                                    },
-                                    'path': {
-                                        'type': 'string'
-                                    },
-                                },
-                            },
-                        },
-                    },
-                    'definitions': {
-                        'type': 'array',
-                        'default': [],
-                        'items': {
-                            'type': 'object',
-                            'properties': {
-                                'when': {
-                                    'type': 'string'
-                                }
-                            },
-                            'patternProperties': {
-                                r'^(?!when$)\w*': spec_list_schema
-                            }
-                        }
-                    },
-                    'specs': spec_list_schema,
-                    'view': {
-                        'anyOf': [
-                            {'type': 'boolean'},
-                            {'type': 'string'},
-                            {
-                                'type': 'object',
-                                'patternProperties': {
-                                    r'\w+': {
-                                        'required': ['root'],
-                                        'additionalProperties': False,
-                                        'properties': {
-                                            'root': {
-                                                'type': 'string'
-                                            },
-                                            'link': {
-                                                'type': 'string',
-                                                'pattern': '(roots|all)',
-                                            },
-                                            'link_type': {
-                                                'type': 'string'
-                                            },
-                                            'select': {
-                                                'type': 'array',
-                                                'items': {
-                                                    'type': 'string'
-                                                }
-                                            },
-                                            'exclude': {
-                                                'type': 'array',
-                                                'items': {
-                                                    'type': 'string'
-                                                }
-                                            },
-                                            'projections': projections_scheme
-                                        }
-                                    }
-                                }
-                            }
-                        ]
-                    },
-                    'concretization': {
-                        'type': 'string',
-                        'enum': ['together', 'separately'],
-                        'default': 'separately'
-                    }
-                }
-            )
-        }
-    }
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Spack environment file schema",
+    "type": "object",
+    "additionalProperties": False,
+    "properties": properties,
+    "definitions": spack.schema.merged.defs,
 }
 
 
-def update(data):
-    """Update the data in place to remove deprecated properties.
+def update(data: Dict[str, Any]) -> bool:
+    """Update the spack.yaml data to the new format.
 
     Args:
-        data (dict): dictionary to be updated
+        data: dictionary to be updated
 
     Returns:
-        True if data was changed, False otherwise
+        ``True`` if data was changed, ``False`` otherwise
     """
-    if 'include' in data:
-        msg = ("included configuration files should be updated manually"
-               " [files={0}]")
-        warnings.warn(msg.format(', '.join(data['include'])))
+    if not isinstance(data, dict):
+        return False
 
-    if 'packages' in data:
-        return spack.schema.packages.update(data['packages'])
-    return False
+    if "include_concrete" not in data:
+        return False
+
+    # Move the old 'include_concrete' paths to reside under the 'include',
+    # ensuring that the lock file name is appended.
+    includes = []
+    for path in data["include_concrete"]:
+        if os.path.basename(path) != "spack.lock":
+            path = os.path.join(path, "spack.lock")
+        includes.append(path)
+
+    # Now add back the includes the environment file already has.
+    if "include" in data:
+        for path in data["include"]:
+            includes.append(path)
+
+    data["include"] = includes
+    del data["include_concrete"]
+
+    return True

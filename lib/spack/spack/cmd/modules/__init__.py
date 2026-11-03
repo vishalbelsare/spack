@@ -1,23 +1,29 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 """Implementation details of the ``spack module`` command."""
 
 import collections
-import os.path
+import os
 import shutil
 import sys
-
-from llnl.util import filesystem, tty
+from typing import Dict, List
 
 import spack.cmd
-import spack.cmd.common.arguments as arguments
 import spack.config
+import spack.error
 import spack.modules
 import spack.modules.common
+import spack.modules.error
 import spack.repo
+import spack.spec
+import spack.store
+from spack.cmd import MultipleSpecsMatch, NoSpecMatches
+from spack.cmd.common import arguments
+from spack.util import tty
+from spack.util.lang import dedupe, stable_partition
+from spack.util.tty import color
 
 description = "manipulate module files"
 section = "environment"
@@ -26,80 +32,67 @@ level = "short"
 
 def setup_parser(subparser):
     subparser.add_argument(
-        '-n', '--name',
-        action='store', dest='module_set_name', default='default',
-        help="Named module set to use from modules configuration."
+        "-n",
+        "--name",
+        action="store",
+        dest="module_set_name",
+        default="default",
+        help="named module set to use from modules configuration",
     )
-    sp = subparser.add_subparsers(metavar='SUBCOMMAND', dest='subparser_name')
+    sp = subparser.add_subparsers(metavar="SUBCOMMAND", dest="subparser_name")
 
-    refresh_parser = sp.add_parser('refresh', help='regenerate module files')
+    refresh_parser = sp.add_parser("refresh", help="regenerate module files")
     refresh_parser.add_argument(
-        '--delete-tree',
-        help='delete the module file tree before refresh',
-        action='store_true'
+        "--delete-tree", help="delete the module file tree before refresh", action="store_true"
     )
     refresh_parser.add_argument(
-        '--upstream-modules',
-        help='generate modules for packages installed upstream',
-        action='store_true'
+        "--upstream-modules",
+        help="generate modules for packages installed upstream",
+        action="store_true",
     )
-    arguments.add_common_arguments(
-        refresh_parser, ['constraint', 'yes_to_all']
-    )
+    arguments.add_common_arguments(refresh_parser, ["constraint", "yes_to_all"])
 
-    find_parser = sp.add_parser('find', help='find module files for packages')
+    find_parser = sp.add_parser("find", help="find module files for packages")
     find_parser.add_argument(
-        '--full-path',
-        help='display full path to module file',
-        action='store_true'
+        "--full-path", help="display full path to module file", action="store_true"
     )
-    arguments.add_common_arguments(
-        find_parser, ['constraint', 'recurse_dependencies']
-    )
+    arguments.add_common_arguments(find_parser, ["constraint", "recurse_dependencies"])
 
-    rm_parser = sp.add_parser('rm', help='remove module files')
-    arguments.add_common_arguments(
-        rm_parser, ['constraint', 'yes_to_all']
-    )
+    rm_parser = sp.add_parser("rm", help="remove module files")
+    arguments.add_common_arguments(rm_parser, ["constraint", "yes_to_all"])
 
     loads_parser = sp.add_parser(
-        'loads',
-        help='prompt the list of modules associated with a constraint'
+        "loads", help="prompt the list of modules associated with a constraint"
     )
     add_loads_arguments(loads_parser)
-    arguments.add_common_arguments(loads_parser, ['constraint'])
+    arguments.add_common_arguments(loads_parser, ["constraint"])
 
     return sp
 
 
 def add_loads_arguments(subparser):
     subparser.add_argument(
-        '--input-only', action='store_false', dest='shell',
-        help='generate input for module command (instead of a shell script)'
+        "--input-only",
+        action="store_false",
+        dest="shell",
+        help="generate input for module command (instead of a shell script)",
     )
     subparser.add_argument(
-        '-p', '--prefix', dest='prefix', default='',
-        help='prepend to module names when issuing module load commands'
+        "-p",
+        "--prefix",
+        dest="prefix",
+        default="",
+        help="prepend to module names when issuing module load commands",
     )
     subparser.add_argument(
-        '-x', '--exclude', dest='exclude', action='append', default=[],
-        help="exclude package from output; may be specified multiple times"
+        "-x",
+        "--exclude",
+        dest="exclude",
+        action="append",
+        default=[],
+        help="exclude package from output; may be specified multiple times",
     )
-    arguments.add_common_arguments(
-        subparser, ['recurse_dependencies']
-    )
-
-
-class MultipleSpecsMatch(Exception):
-    """Raised when multiple specs match a constraint, in a context where
-    this is not allowed.
-    """
-
-
-class NoSpecMatches(Exception):
-    """Raised when no spec matches a constraint, in a context where
-    this is not allowed.
-    """
+    arguments.add_common_arguments(subparser, ["recurse_dependencies"])
 
 
 def one_spec_or_raise(specs):
@@ -117,24 +110,32 @@ def one_spec_or_raise(specs):
 
 
 def check_module_set_name(name):
-    modules_config = spack.config.get('modules')
-    valid_names = set([key for key, value in modules_config.items()
-                       if isinstance(value, dict) and value.get('enable', [])])
-    if 'enable' in modules_config and modules_config['enable']:
-        valid_names.add('default')
+    modules = spack.config.CONFIG.get("modules")
+    if name != "prefix_inspections" and name in modules:
+        return
 
-    if name not in valid_names:
-        msg = "Cannot use invalid module set %s." % name
-        msg += "    Valid module set names are %s" % list(valid_names)
-        raise spack.config.ConfigError(msg)
+    names = [k for k in modules if k != "prefix_inspections"]
+
+    if not names:
+        raise spack.error.ConfigError(
+            f"Module set configuration is missing. Cannot use module set '{name}'"
+        )
+
+    pretty_names = "', '".join(names)
+
+    raise spack.error.ConfigError(
+        f"Cannot use invalid module set '{name}'.",
+        f"Valid module set names are: '{pretty_names}'.",
+    )
 
 
 _missing_modules_warning = (
     "Modules have been omitted for one or more specs, either"
-    " because they were blacklisted or because the spec is"
+    " because they were excluded or because the spec is"
     " associated with a package that is installed upstream and"
     " that installation has not generated a module file. Rerun"
-    " this command with debug output enabled for more details.")
+    " this command with debug output enabled for more details."
+)
 
 
 def loads(module_type, specs, args, out=None):
@@ -154,111 +155,253 @@ def loads(module_type, specs, args, out=None):
         seen_add = seen.add
         for spec in specs_from_user_constraint:
             specs.extend(
-                [item for item in spec.traverse(order='post', cover='nodes')
-                 if not (item in seen or seen_add(item))]
+                [
+                    item
+                    for item in spec.traverse(order="post", cover="nodes")
+                    if not (item in seen or seen_add(item))
+                ]
             )
 
-    modules = list(
-        (spec,
-         spack.modules.common.get_module(
-             module_type, spec, get_full_path=False,
-             module_set_name=args.module_set_name, required=False))
-        for spec in specs)
+    cache = spack.modules.common.ModuleConfigurationCache()
+    modules = [
+        (
+            spec,
+            spack.modules.get_module(
+                module_type,
+                spec,
+                get_full_path=False,
+                module_set_name=args.module_set_name,
+                required=False,
+                cache=cache,
+            ),
+        )
+        for spec in specs
+    ]
 
-    module_commands = {
-        'tcl': 'module load ',
-        'lmod': 'module load ',
-    }
+    # Of the installations folded into one module file, only the first gets a live load line
+    module_cls = spack.modules.module_types[module_type]
+    with_module = {spec for spec, mod in modules if mod}
+    shares_file_with: Dict[spack.spec.Spec, spack.spec.Spec] = {}
+    for spec in with_module:
+        conf = module_cls.from_spec(spec, args.module_set_name, cache=cache).conf
+        first = next((s for s in conf.specs_in_file if s in with_module), spec)
+        if first != spec:
+            shares_file_with[spec] = first
 
-    d = {
-        'command': '' if not args.shell else module_commands[module_type],
-        'prefix': args.prefix
-    }
+    module_commands = {"tcl": "module load ", "lmod": "module load "}
+
+    d = {"command": "" if not args.shell else module_commands[module_type], "prefix": args.prefix}
 
     exclude_set = set(args.exclude)
-    load_template = '{comment}{exclude}{command}{prefix}{name}'
+    load_template = "{comment}{exclude}{command}{prefix}{name}"
     for spec, mod in modules:
         if not mod:
-            module_output_for_spec = (
-                '## blacklisted or missing from upstream: {0}'.format(
-                    spec.format()))
+            module_output_for_spec = "## excluded or missing from upstream: {0}".format(
+                spec.format()
+            )
         else:
-            d['exclude'] = '## ' if spec.name in exclude_set else ''
-            d['comment'] = '' if not args.shell else '# {0}\n'.format(
-                spec.format())
-            d['name'] = mod
+            excluded = spec.name in exclude_set or spec in shares_file_with
+            d["exclude"] = "## " if excluded else ""
+            d["comment"] = "" if not args.shell else "# {0}\n".format(spec.format())
+            if spec in shares_file_with and args.shell:
+                d["comment"] += "# shares its module file with {0}\n".format(
+                    shares_file_with[spec].format()
+                )
+            d["name"] = mod
             module_output_for_spec = load_template.format(**d)
         out.write(module_output_for_spec)
-        out.write('\n')
+        out.write("\n")
 
     if not all(mod for _, mod in modules):
         tty.warn(_missing_modules_warning)
+    if shares_file_with:
+        tty.warn(
+            "Installations sharing a module file cannot be loaded together: only the first load"
+            " line of each module file is left active"
+        )
+
+
+def fold_into_one_file(writers) -> bool:
+    """Whether the module file of the first writer folds the installations of all of them."""
+    specs_in_file = writers[0].conf.specs_in_file
+    return all(x.spec in specs_in_file for x in writers)
 
 
 def find(module_type, specs, args):
     """Retrieve paths or use names of module files"""
     check_module_set_name(args.module_set_name)
 
+    cache = spack.modules.common.ModuleConfigurationCache()
+    if len(specs) > 1:
+        module_cls = spack.modules.module_types[module_type]
+        writers = [module_cls.from_spec(s, args.module_set_name, cache=cache) for s in specs]
+        # An installation excluded from module files does not make the constraint ambiguous
+        writers = [w for w in writers if not w.conf.excluded] or writers
+        specs = [w.spec for w in writers]
+
+        # Installations folded into one module file are found by the name of the file
+        first = writers[0]
+        if (
+            len(writers) > 1
+            and not args.recurse_dependencies
+            and fold_into_one_file(writers)
+            and first.has_installation
+        ):
+            print(first.layout.filename if args.full_path else first.layout.name)
+            return
+
     single_spec = one_spec_or_raise(specs)
 
     if args.recurse_dependencies:
         dependency_specs_to_retrieve = list(
-            single_spec.traverse(root=False, order='post', cover='nodes',
-                                 deptype=('link', 'run')))
+            single_spec.traverse(root=False, order="post", cover="nodes", deptype=("link", "run"))
+        )
     else:
         dependency_specs_to_retrieve = []
 
     try:
         modules = [
-            spack.modules.common.get_module(
-                module_type, spec, args.full_path,
-                module_set_name=args.module_set_name, required=False)
-            for spec in dependency_specs_to_retrieve]
+            spack.modules.get_module(
+                module_type,
+                spec,
+                args.full_path,
+                module_set_name=args.module_set_name,
+                required=False,
+                cache=cache,
+            )
+            for spec in dependency_specs_to_retrieve
+        ]
 
         modules.append(
-            spack.modules.common.get_module(
-                module_type, single_spec, args.full_path,
-                module_set_name=args.module_set_name, required=True))
-    except spack.modules.common.ModuleNotFoundError as e:
+            spack.modules.get_module(
+                module_type,
+                single_spec,
+                args.full_path,
+                module_set_name=args.module_set_name,
+                required=True,
+                cache=cache,
+            )
+        )
+    except spack.modules.error.ModuleNotFoundError as e:
         tty.die(e.message)
 
     if not all(modules):
         tty.warn(_missing_modules_warning)
-    modules = list(x for x in modules if x)
-    print(' '.join(modules))
+    modules = [x for x in modules if x]
+    print(" ".join(modules))
+
+
+def _show_specs(message: str, specs: List[spack.spec.Spec]) -> None:
+    """Prints a message followed by a long listing of specs, for a confirmation prompt."""
+    tty.msg(message)
+    spack.cmd.display_specs(specs, long=True)
+    print("")
 
 
 def rm(module_type, specs, args):
-    """Deletes the module files associated with every spec in specs, for every
-    module type in module types.
-    """
+    """Removes the installations of specs from their module files, deleting the files that
+    hold no other installation."""
     check_module_set_name(args.module_set_name)
 
-    module_cls = spack.modules.module_types[module_type]
-    module_exist = lambda x: os.path.exists(
-        module_cls(x, args.module_set_name).layout.filename)
-
-    specs_with_modules = [spec for spec in specs if module_exist(spec)]
-
-    modules = [module_cls(spec, args.module_set_name)
-               for spec in specs_with_modules]
-
-    if not modules:
-        tty.die('No module file matches your query')
-
-    # Ask for confirmation
     if not args.yes_to_all:
-        msg = 'You are about to remove {0} module files for:\n'
-        tty.msg(msg.format(module_type))
-        spack.cmd.display_specs(specs_with_modules, long=True)
-        print('')
-        answer = tty.get_yes_or_no('Do you want to proceed?')
+        # Avoid holding a lock to ask for confirmation. In rare cases this may show an outdated
+        # list of specs (when the specs change between here and the re-writing a few lines below)
+        cache = spack.modules.common.ModuleConfigurationCache()
+        writers = _rm_writers(module_type, specs, args.module_set_name, cache)
+        rewritten, deleted = stable_partition(writers, lambda x: x.has_other_installations)
+        if deleted:
+            _show_specs(
+                f"You are about to remove {module_type} module files for:\n",
+                [s for x in deleted for s in x.conf.removed_specs],
+            )
+        if rewritten:
+            _show_specs(
+                f"You are about to remove the following installations from {module_type} "
+                "module files shared with other installations:\n",
+                [s for x in rewritten for s in x.conf.removed_specs],
+            )
+            _show_specs(
+                "These module files are written again for the installations they keep:\n",
+                [s for x in rewritten for s in x.conf.specs_in_file],
+            )
+        answer = tty.get_yes_or_no("Do you want to proceed?")
         if not answer:
-            tty.die('Will not remove any module files')
+            tty.die("Will not remove any module files")
 
-    # Remove the module files
-    for s in modules:
-        s.remove()
+    root = spack.modules.common.root_path(module_type, args.module_set_name)
+    with spack.modules.common.module_root_transaction(root) as cache:
+        for x in _rm_writers(module_type, specs, args.module_set_name, cache):
+            x.remove_installation()
+
+
+def _rm_writers(
+    module_type: str,
+    specs: List[spack.spec.Spec],
+    module_set_name: str,
+    cache: spack.modules.common.ModuleConfigurationCache,
+) -> List[spack.modules.common.BaseModuleFileWriter]:
+    """Returns a writer for each module file holding some of the specs, which removes them
+    from the file. Exits with an error if no module file holds any of them.
+    """
+    module_cls = spack.modules.module_types[module_type]
+
+    # Installations sharing a module file are removed from it together
+    file2specs: Dict[str, List[spack.spec.Spec]] = collections.defaultdict(list)
+    for spec in specs:
+        writer = module_cls.from_spec(spec, module_set_name, cache=cache)
+        if writer.has_installation:
+            file2specs[writer.layout.filename].append(spec)
+
+    if not file2specs:
+        tty.die("No module file matches your query")
+
+    return [
+        module_cls.from_spec(
+            group[0], module_set_name, removed_specs=frozenset(group), cache=cache
+        )
+        for group in file2specs.values()
+    ]
+
+
+def _refresh_writers(
+    module_type: str,
+    specs: List[spack.spec.Spec],
+    module_set_name: str,
+    cache: spack.modules.common.ModuleConfigurationCache,
+) -> List[spack.modules.common.BaseModuleFileWriter]:
+    """Returns the writers of the specs that are installed and not excluded."""
+    cls = spack.modules.module_types[module_type]
+    writers = [
+        cls.from_spec(spec, module_set_name, cache=cache)
+        for spec in specs
+        # Skip unknown packages, and installations removed by another process
+        if spack.repo.PATH.exists(spec.name) and cache.installed(spec)
+    ]
+    return [x for x in writers if not x.conf.excluded]
+
+
+#: Query of the specs whose module files are regenerated by ``refresh``
+_REFRESH_QUERY = {"installed": True, "predicate_fn": lambda x: spack.repo.PATH.exists(x.spec.name)}
+
+
+def _refresh_specs(specs: List[spack.spec.Spec], upstream_modules: bool) -> List[spack.spec.Spec]:
+    """Returns the specs whose module files ``refresh`` regenerates, out of the queried ones."""
+    if upstream_modules:
+        return specs
+    with spack.store.STORE.db.read_transaction():
+        return [s for s in specs if not spack.store.STORE.db.installed_upstream(s)]
+
+
+def _clear_module_root(root: str) -> None:
+    """Removes everything in a module root, except its lock file."""
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.name == spack.modules.common.MODULE_ROOT_LOCK:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.remove(entry.path)
 
 
 def refresh(module_type, specs, args):
@@ -269,117 +412,123 @@ def refresh(module_type, specs, args):
 
     # Prompt a message to the user about what is going to change
     if not specs:
-        tty.msg('No package matches your query')
+        tty.msg("No package matches your query")
         return
-
-    if not args.upstream_modules:
-        specs = list(s for s in specs if not s.package.installed_upstream)
 
     if not args.yes_to_all:
-        msg = 'You are about to regenerate {types} module files for:\n'
-        tty.msg(msg.format(types=module_type))
-        spack.cmd.display_specs(specs, long=True)
-        print('')
-        answer = tty.get_yes_or_no('Do you want to proceed?')
+        specs = _refresh_specs(specs, args.upstream_modules)
+        cache = spack.modules.common.ModuleConfigurationCache()
+        writers = _refresh_writers(module_type, specs, args.module_set_name, cache)
+        _show_specs(f"You are about to regenerate {module_type} module files for:\n", specs)
+        # A module file folding several installations is written for all of them
+        selected = set(specs)
+        folded = list(
+            dedupe(s for x in writers for s in x.conf.other_specs_in_file if s not in selected)
+        )
+        if folded:
+            _show_specs(
+                "The following installations share a module file with them and are written "
+                "again too:\n",
+                folded,
+            )
+        answer = tty.get_yes_or_no("Do you want to proceed?")
         if not answer:
-            tty.die('Module file regeneration aborted.')
+            tty.die("Module file regeneration aborted.")
 
-    # Cycle over the module types and regenerate module files
+    module_type_root = spack.modules.common.root_path(module_type, args.module_set_name)
+    with spack.modules.common.module_root_transaction(module_type_root) as cache:
+        # Other processes may have installed or uninstalled specs while this one waited
+        specs = _refresh_specs(args.specs(**_REFRESH_QUERY), args.upstream_modules)
+        writers = _refresh_writers(module_type, specs, args.module_set_name, cache)
+        # Writers sharing a module file clash, unless the file folds all their installations
+        file2writer = collections.defaultdict(list)
+        for item in writers:
+            file2writer[item.layout.filename].append(item)
 
-    cls = spack.modules.module_types[module_type]
-
-    # Skip unknown packages.
-    writers = [
-        cls(spec, args.module_set_name) for spec in specs
-        if spack.repo.path.exists(spec.name)]
-
-    # Filter blacklisted packages early
-    writers = [x for x in writers if not x.conf.blacklisted]
-
-    # Detect name clashes in module files
-    file2writer = collections.defaultdict(list)
-    for item in writers:
-        file2writer[item.layout.filename].append(item)
-
-    if len(file2writer) != len(writers):
-        message = 'Name clashes detected in module files:\n'
-        for filename, writer_list in file2writer.items():
-            if len(writer_list) > 1:
-                message += '\nfile: {0}\n'.format(filename)
+        clashes = {
+            f: w for f, w in file2writer.items() if len(w) > 1 and not fold_into_one_file(w)
+        }
+        if clashes:
+            spec_fmt_str = "{name}@={version}%{compiler}/{hash:7} {variants} arch={arch}"
+            message = "Name clashes detected in module files:\n"
+            for filename, writer_list in clashes.items():
+                message += "\nfile: {0}\n".format(filename)
                 for x in writer_list:
-                    message += 'spec: {0}\n'.format(x.spec.format())
-        tty.error(message)
-        tty.error('Operation aborted')
-        raise SystemExit(1)
+                    message += "spec: {0}\n".format(x.spec.format(spec_fmt_str))
+                if len({x.spec.version for x in writer_list}) > 1:
+                    message += (
+                        "installations of different versions cannot share a module file, "
+                        "add {version} to the projection\n"
+                    )
+            tty.error(message)
+            tty.error("Operation aborted")
+            raise SystemExit(1)
 
-    if len(writers) == 0:
-        msg = 'Nothing to be done for {0} module files.'
-        tty.msg(msg.format(module_type))
-        return
-    # If we arrived here we have at least one writer
-    module_type_root = writers[0].layout.dirname()
+        if len(writers) == 0:
+            msg = "Nothing to be done for {0} module files."
+            tty.msg(msg.format(module_type))
+            return
 
-    # Proceed regenerating module files
-    tty.msg('Regenerating {name} module files'.format(name=module_type))
-    if os.path.isdir(module_type_root) and args.delete_tree:
-        shutil.rmtree(module_type_root, ignore_errors=False)
-    filesystem.mkdirp(module_type_root)
+        # Proceed regenerating module files
+        tty.msg("Regenerating {name} module files".format(name=module_type))
+        if args.delete_tree:
+            spack.modules.common.add_shared_access_to_module_root(module_type_root)
+            _clear_module_root(module_type_root)
 
-    # Dump module index after potentially removing module tree
-    spack.modules.common.generate_module_index(
-        module_type_root, writers, overwrite=args.delete_tree)
-    for x in writers:
-        try:
-            x.write(overwrite=True)
-        except Exception as e:
-            tty.debug(e)
-            msg = 'Could not write module file [{0}]'
-            tty.warn(msg.format(x.layout.filename))
-            tty.warn('\t--> {0} <--'.format(str(e)))
+        # Dump module index after potentially clearing module tree
+        spack.modules.common.generate_module_index(
+            module_type_root, writers, overwrite=args.delete_tree
+        )
+        errors = []
+        # A module file folding several installations is written once, from the first of them
+        for x in (writer_list[0] for writer_list in file2writer.values()):
+            try:
+                x.write(overwrite=True)
+            except spack.error.SpackError as e:
+                msg = f"{x.layout.filename}: {e.message}"
+                errors.append(msg)
+            except Exception as e:
+                msg = f"{x.layout.filename}: {str(e)}"
+                errors.append(msg)
+
+        if errors:
+            errors.insert(0, color.colorize("@*{some module files could not be written}"))
+            tty.warn("\n".join(errors))
 
 
 #: Dictionary populated with the list of sub-commands.
 #: Each sub-command must be callable and accept 3 arguments:
 #:
-#:   - module_type: the type of module it refers to
-#:   - specs : the list of specs to be processed
-#:   - args : namespace containing the parsed command line arguments
-callbacks = {
-    'refresh': refresh,
-    'rm': rm,
-    'find': find,
-    'loads': loads
-}
+#: - module_type: the type of module it refers to
+#: - specs : the list of specs to be processed
+#: - args : namespace containing the parsed command line arguments
+callbacks = {"refresh": refresh, "rm": rm, "find": find, "loads": loads}
 
 
 def modules_cmd(parser, args, module_type, callbacks=callbacks):
-
     # Qualifiers to be used when querying the db for specs
-    constraint_qualifiers = {
-        'refresh': {
-            'installed': True,
-            'known': True
-        },
-    }
-    query_args = constraint_qualifiers.get(args.subparser_name, {})
+    query_args = _REFRESH_QUERY if args.subparser_name == "refresh" else {}
 
     # Get the specs that match the query from the DB
     specs = args.specs(**query_args)
 
     try:
-
         callbacks[args.subparser_name](module_type, specs, args)
 
     except MultipleSpecsMatch:
-        msg = "the constraint '{query}' matches multiple packages:\n"
+        query = " ".join(str(s) for s in args.constraint_specs)
+        msg = f"the constraint '{query}' matches multiple packages:\n"
         for s in specs:
-            spec_fmt = '{hash:7} {name}{@version}{%compiler}'
-            spec_fmt += '{compiler_flags}{variants}{arch=architecture}'
-            msg += '\t' + s.cformat(spec_fmt) + '\n'
-        tty.error(msg.format(query=args.constraint))
-        tty.die('In this context exactly **one** match is needed: please specify your constraints better.')  # NOQA: ignore=E501
+            spec_fmt = (
+                "{hash:7} {name}{@version}{compiler_flags}{variants}"
+                "{ platform=architecture.platform}{ os=architecture.os}"
+                "{ target=architecture.target}"
+                "{%compiler}"
+            )
+            msg += "\t" + s.cformat(spec_fmt) + "\n"
+        tty.die(msg, "In this context exactly *one* match is needed.")
 
     except NoSpecMatches:
-        msg = "the constraint '{query}' matches no package."
-        tty.error(msg.format(query=args.constraint))
-        tty.die('In this context exactly **one** match is needed: please specify your constraints better.')  # NOQA: ignore=E501
+        query = " ".join(str(s) for s in args.constraint_specs)
+        msg = f"the constraint '{query}' matches no package."
+        tty.die(msg, "In this context exactly *one* match is needed.")

@@ -1,53 +1,76 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import pytest
 
+import spack.audit
+import spack.paths
 from spack.main import SpackCommand
+from spack.test.conftest import MockHTTPResponse
 
-audit = SpackCommand('audit')
+audit = SpackCommand("audit")
 
 
-@pytest.mark.parametrize('pkgs,expected_returncode', [
-    # A single package with issues, should exit 1
-    (['wrong-variant-in-conflicts'], 1),
-    # A "sane" package should exit 0
-    (['mpileaks'], 0),
-    # A package with issues and a package without should exit 1
-    (['wrong-variant-in-conflicts', 'mpileaks'], 1),
-    (['mpileaks', 'wrong-variant-in-conflicts'], 1),
-])
-def test_audit_packages(
-        pkgs, expected_returncode, mutable_config, mock_packages
-):
+@pytest.mark.parametrize(
+    "pkgs,expected_returncode",
+    [
+        # A single package with issues, should exit 1
+        (["wrong-variant-in-conflicts"], 1),
+        # A "sane" package should exit 0
+        (["mpileaks"], 0),
+        # A package with issues and a package without should exit 1
+        (["wrong-variant-in-conflicts", "mpileaks"], 1),
+        (["mpileaks", "wrong-variant-in-conflicts"], 1),
+    ],
+)
+def test_audit_packages(pkgs, expected_returncode, mutable_config, mock_packages):
     """Sanity check ``spack audit packages`` to make sure it works."""
-    audit('packages', *pkgs, fail_on_error=False)
+    audit("packages", *pkgs, fail_on_error=False)
     assert audit.returncode == expected_returncode
 
 
 def test_audit_configs(mutable_config, mock_packages):
     """Sanity check ``spack audit packages`` to make sure it works."""
-    audit('configs', fail_on_error=False)
+    audit("configs", fail_on_error=False)
     # The mock configuration has duplicate definitions of some compilers
     assert audit.returncode == 1
 
 
-def test_audit_packages_https(mutable_config, mock_packages):
+def test_audit_packages_https(mutable_config, mock_packages, monkeypatch):
+    """Test audit packages-https with mocked network calls."""
+    monkeypatch.setattr(spack.audit, "urlopen", lambda url: MockHTTPResponse(200, "OK"))
 
     # Without providing --all should fail
-    audit('packages-https', fail_on_error=False)
-    # The mock configuration has duplicate definitions of some compilers
-    assert audit.returncode == 1
+    audit("packages-https", fail_on_error=False)
+    assert audit.returncode == 2
 
     # This uses http and should fail
-    audit('packages-https', "preferred-test", fail_on_error=False)
+    audit("packages-https", "test-dependency", fail_on_error=False)
     assert audit.returncode == 1
 
     # providing one or more package names with https should work
-    audit('packages-https', "cmake", fail_on_error=True)
+    audit("packages-https", "cmake", fail_on_error=True)
     assert audit.returncode == 0
 
     # providing one or more package names with https should work
-    audit('packages-https', "cmake", "conflict", fail_on_error=True)
+    audit("packages-https", "cmake", "conflict", fail_on_error=True)
     assert audit.returncode == 0
+
+
+@pytest.mark.parametrize("subcommand", [["packages"], ["packages-https", "--all"], ["externals"]])
+def test_audit_fails_on_repository_that_cannot_be_constructed(
+    subcommand, tmp_path, mutable_config, monkeypatch
+):
+    """Tests that package audits exit with an error when a configured repository cannot be
+    constructed."""
+    monkeypatch.setattr(spack.audit, "urlopen", lambda url: MockHTTPResponse(200, "OK"))
+    repo_dir = tmp_path / "unsupported"
+    (repo_dir / "packages").mkdir(parents=True)
+    (repo_dir / "repo.yaml").write_text("repo:\n  namespace: unsupported\n  api: v99.0\n")
+    mutable_config.set(
+        "repos", {"builtin_mock": spack.paths.mock_packages_path, "unsupported": str(repo_dir)}
+    )
+
+    output = audit(*subcommand, fail_on_error=False)
+    assert audit.returncode == 1
+    assert "Package API v99.0 is not supported" in output

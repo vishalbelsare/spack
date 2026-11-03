@@ -1,7 +1,9 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+import spack.config
+
 
 def get_projection(projections, spec):
     """
@@ -9,8 +11,10 @@ def get_projection(projections, spec):
     """
     all_projection = None
     for spec_like, projection in projections.items():
-        if spec.satisfies(spec_like, strict=True):
-            return projection
-        elif spec_like == 'all':
-            all_projection = projection
+        # "all" is a catch-all, not a spec: satisfies("all") would trigger a package lookup
+        # to check whether "all" is a virtual provided by the spec.
+        if spec_like == "all":
+            all_projection = spack.config.substitute_path_variables(projection)
+        elif spec.satisfies(spec_like):
+            return spack.config.substitute_path_variables(projection)
     return all_projection

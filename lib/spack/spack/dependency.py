@@ -1,69 +1,34 @@
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+"""Data structures that represent Spack's dependency relationships."""
 
-"""Data structures that represent Spack's dependency relationships.
-"""
-from six import string_types
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import spack.deptypes as dt
 import spack.spec
 
-#: The types of dependency relationships that Spack understands.
-all_deptypes = ('build', 'link', 'run', 'test')
-
-#: Default dependency type if none is specified
-default_deptype = ('build', 'link')
+if TYPE_CHECKING:
+    import spack.patch
 
 
-def deptype_chars(*type_tuples):
-    """Create a string representing deptypes for many dependencies.
-
-    The string will be some subset of 'blrt', like 'bl ', 'b t', or
-    ' lr ' where each letter in 'blrt' stands for 'build', 'link',
-    'run', and 'test' (the dependency types).
-
-    For a single dependency, this just indicates that the dependency has
-    the indicated deptypes. For a list of dependnecies, this shows
-    whether ANY dpeendency in the list has the deptypes (so the deptypes
-    are merged).
-    """
-    types = set()
-    for t in type_tuples:
-        if t:
-            types.update(t)
-
-    return ''.join(t[0] if t in types else ' ' for t in all_deptypes)
+#: Recipes declare the same requirement over and over, so equal unpatched dependencies are one
+#: object; see :func:`intern_dependency`.
+_DEPENDENCY_CACHE: Dict[Tuple[str, dt.DepFlag], "Dependency"] = {}
 
 
-def canonical_deptype(deptype):
-    """Convert deptype to a canonical sorted tuple, or raise ValueError.
-
-    Args:
-        deptype (str or list or tuple): string representing dependency
-            type, or a list/tuple of such strings.  Can also be the
-            builtin function ``all`` or the string 'all', which result in
-            a tuple of all dependency types known to Spack.
-    """
-    if deptype in ('all', all):
-        return all_deptypes
-
-    elif isinstance(deptype, string_types):
-        if deptype not in all_deptypes:
-            raise ValueError('Invalid dependency type: %s' % deptype)
-        return (deptype,)
-
-    elif isinstance(deptype, (tuple, list, set)):
-        bad = [d for d in deptype if d not in all_deptypes]
-        if bad:
-            raise ValueError(
-                'Invalid dependency types: %s' % ','.join(str(t) for t in bad))
-        return tuple(sorted(deptype))
-
-    raise ValueError('Invalid dependency type: %s' % repr(deptype))
+def intern_dependency(dependency: "Dependency") -> "Dependency":
+    """Return the shared Dependency equal to ``dependency``. Only unpatched dependencies are
+    shared, since patches are attached per dependent package."""
+    key = (str(dependency.spec), dependency.depflag)
+    cached = _DEPENDENCY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    _DEPENDENCY_CACHE[key] = dependency
+    return dependency
 
 
-class Dependency(object):
+class Dependency:
     """Class representing metadata for a dependency on a package.
 
     This class differs from ``spack.spec.DependencySpec`` because it
@@ -89,46 +54,31 @@ class Dependency(object):
     the dependency package can coexist with the patched version.
 
     """
-    def __init__(self, pkg, spec, type=default_deptype):
+
+    __slots__ = "spec", "patches", "depflag"
+
+    def __init__(self, spec: spack.spec.Spec, depflag: dt.DepFlag = dt.DEFAULT):
         """Create a new Dependency.
 
         Args:
-            pkg (type): Package that has this dependency
-            spec (Spec): Spec indicating dependency requirements
-            type (sequence): strings describing dependency relationship
+            spec: Spec indicating dependency requirements
+            depflag: flags describing the dependency relationship
         """
-        assert isinstance(spec, spack.spec.Spec)
+        self.spec = spec
 
-        self.pkg = pkg
-        self.spec = spec.copy()
-
-        # This dict maps condition specs to lists of Patch objects, just
-        # as the patches dict on packages does.
-        self.patches = {}
-
-        if type is None:
-            self.type = set(default_deptype)
-        else:
-            self.type = set(type)
+        # Maps condition specs to lists of Patch objects, as the patches dict on packages
+        # does. None until a patch directive attaches one, which few packages do.
+        self.patches: Optional[Dict[spack.spec.Spec, List["spack.patch.Patch"]]] = None
+        self.depflag = depflag
 
     @property
-    def name(self):
+    def name(self) -> str:
         """Get the name of the dependency package."""
         return self.spec.name
 
-    def merge(self, other):
-        """Merge constraints, deptypes, and patches of other into self."""
-        self.spec.constrain(other.spec)
-        self.type |= other.type
-
-        # concatenate patch lists, or just copy them in
-        for cond, p in other.patches.items():
-            if cond in self.patches:
-                self.patches[cond].extend(other.patches[cond])
-            else:
-                self.patches[cond] = other.patches[cond]
-
-    def __repr__(self):
-        types = deptype_chars(self.type)
-        return '<Dependency: %s -> %s [%s]>' % (
-            self.pkg.name, self.spec, types)
+    def __repr__(self) -> str:
+        types = dt.flag_to_chars(self.depflag)
+        if self.patches:
+            return f"<Dependency: {self.spec} [{types}, {self.patches}]>"
+        else:
+            return f"<Dependency: {self.spec} [{types}]>"

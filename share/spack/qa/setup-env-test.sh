@@ -1,7 +1,6 @@
 #!/bin/sh
 #
-# Copyright 2013-2021 Lawrence Livermore National Security, LLC and other
-# Spack Project Developers. See the top-level COPYRIGHT file for details.
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
@@ -60,12 +59,12 @@ cd() {
 # Create a fake mock package install and store its location for later
 title "Setup"
 echo "Creating a mock package installation"
-spack -m install --fake a
-a_install=$(spack location -i a)
-a_module=$(spack -m module tcl find a)
+spack -m install --fake shell-a
+a_install=$(spack location -i shell-a)
+a_module=$(spack -m module tcl find shell-a)
 
-b_install=$(spack location -i b)
-b_module=$(spack -m module tcl find b)
+b_install=$(spack location -i shell-b)
+b_module=$(spack -m module tcl find shell-b)
 
 # Create a test environment for testing environment commands
 echo "Creating a mock environment"
@@ -80,7 +79,7 @@ cleanup() {
 
     title "Cleanup"
     echo "Removing test packages before exiting."
-    spack -m uninstall -yf b a
+    spack -m uninstall -yf shell-b shell-a
 }
 
 # -----------------------------------------------------------------------
@@ -96,7 +95,7 @@ contains "usage: spack " spack help --all
 title 'Testing `spack cd`'
 contains "usage: spack cd " spack cd -h
 contains "usage: spack cd " spack cd --help
-contains "cd $b_install" spack cd -i b
+contains "cd $b_install" spack cd -i shell-b
 
 title 'Testing `spack module`'
 contains "usage: spack module " spack -m module -h
@@ -104,24 +103,24 @@ contains "usage: spack module " spack -m module --help
 contains "usage: spack module " spack -m module
 
 title 'Testing `spack load`'
-contains "export PATH=$(spack -m location -i b)/bin" spack -m load --only package --sh b
-succeeds spack -m load b
-LIST_CONTENT=`spack -m load b; spack load --list`
-contains "b@" echo $LIST_CONTENT
-does_not_contain "a@" echo $LIST_CONTENT
+contains "export PATH=$(spack -m location -i shell-b)/bin" spack -m load --sh shell-b
+succeeds spack -m load shell-b
+LIST_CONTENT=`spack -m load shell-b; spack load --list`
+contains "shell-b@" echo $LIST_CONTENT
+does_not_contain "shell-a@" echo $LIST_CONTENT
 fails spack -m load -l
 # test a variable MacOS clears and one it doesn't for recursive loads
-contains "export PATH=$(spack -m location -i a)/bin:$(spack -m location -i b)/bin" spack -m load --sh a
-succeeds spack -m load --only dependencies a
-succeeds spack -m load --only package a
+contains "export PATH=$(spack -m location -i shell-a)/bin" spack -m load --sh shell-a
+contains "export PATH=$(spack -m location -i shell-b)/bin" spack -m load --sh shell-b
+succeeds spack -m load shell-a
 fails spack -m load d
 contains "usage: spack load " spack -m load -h
 contains "usage: spack load " spack -m load -h d
 contains "usage: spack load " spack -m load --help
 
 title 'Testing `spack unload`'
-spack -m load b a  # setup
-succeeds spack -m unload b
+spack -m load shell-b shell-a  # setup
+succeeds spack -m unload shell-b
 succeeds spack -m unload --all
 spack -m unload --all # cleanup
 fails spack -m unload -l
@@ -140,7 +139,6 @@ contains " spack env list " spack env list --help
 
 title 'Testing `spack env activate`'
 contains "No such environment:" spack env activate no_such_environment
-contains "env activate requires an environment " spack env activate
 contains "usage: spack env activate " spack env activate -h
 contains "usage: spack env activate " spack env activate --help
 
@@ -149,6 +147,25 @@ contains "Error: No environment is currently active" spack env deactivate
 contains "usage: spack env deactivate " spack env deactivate no_such_environment
 contains "usage: spack env deactivate " spack env deactivate -h
 contains "usage: spack env deactivate " spack env deactivate --help
+
+title "Testing 'spack config edit'"
+echo "Testing 'spack config edit' with malformed spack.yaml"
+spack env activate --temp
+bad_yaml_env=$(spack location -e)
+mv $bad_yaml_env/spack.yaml $bad_yaml_env/.backup
+echo "bad_yaml" > $bad_yaml_env/spack.yaml
+EDITOR=cat contains "Error: " spack config edit  # error message prints first
+EDITOR=cat contains "bad_yaml" spack config edit  # followed by call to EDITOR
+
+echo "testing 'spack config edit' with non-complying spack.yaml"
+cat > $bad_yaml_env/spack.yaml <<EOF
+spack:
+  foo: bar
+EOF
+EDITOR=cat contains "Error: " spack config edit  # error message prints first
+EDITOR=cat contains "foo: bar" spack config edit  # followed by call to EDITOR
+mv $bad_yaml_env/.backup $bad_yaml_env/spack.yaml
+despacktivate
 
 title 'Testing activate and deactivate together'
 echo "Testing 'spack env activate spack_test_env'"
@@ -197,6 +214,84 @@ contains "spack_test_2_env" sh -c 'echo $PATH'
 does_not_contain "spack_test_env" sh -c 'echo $PATH'
 despacktivate
 
+echo "Testing default environment"
+spack env activate
+contains "In environment default" spack env status
+despacktivate
+
 echo "Correct error exit codes for activate and deactivate"
 fails spack env activate nonexisiting_environment
 fails spack env deactivate
+
+echo "Correct error exit codes for unit-test when it fails"
+fails spack unit-test fail
+
+title "Testing config override from command line, outside of an environment"
+contains 'True' spack -c config:ccache:true python -c "import spack.config;print(spack.config.CONFIG.get('config:ccache'))"
+contains 'True' spack -C "$SHARE_DIR/qa/configuration" python -c "import spack.config;print(spack.config.CONFIG.get('config:ccache'))"
+succeeds spack -c config:ccache:true python "$SHARE_DIR/qa/config_state.py"
+succeeds spack -C "$SHARE_DIR/qa/configuration" python "$SHARE_DIR/qa/config_state.py"
+
+title "Testing config override from command line, inside an environment"
+spack env activate --temp
+spack config add "config:ccache:false"
+
+contains 'True' spack -c config:ccache:true python -c "import spack.config;print(spack.config.CONFIG.get('config:ccache'))"
+succeeds spack -c config:ccache:true python "$SHARE_DIR/qa/config_state.py"
+
+spack env deactivate
+
+
+# -----------------------------------------------------------------------
+# Make sure environments and custom scopes on the CLI have the right
+# precedence, based on order of appearance
+# -----------------------------------------------------------------------
+echo "Testing correct scope precedence on command line"
+contains 'unify: true' spack -e $QA_DIR/scopes/true config get concretizer
+contains 'unify: true' spack -D $QA_DIR/scopes/true config get concretizer
+contains 'unify: false' spack -C $QA_DIR/scopes/false config get concretizer
+contains 'unify: when_possible' spack -C $QA_DIR/scopes/wp config get concretizer
+contains 'unify: false' \
+         spack -C $QA_DIR/scopes/wp -C $QA_DIR/scopes/false config get concretizer
+
+contains 'unify: false' \
+         spack -C $QA_DIR/scopes/wp \
+               -C $QA_DIR/scopes/false \
+               -e $QA_DIR/scopes/true \
+               config get concretizer
+
+contains 'unify: when_possible' \
+         spack -C $QA_DIR/scopes/false \
+               -e $QA_DIR/scopes/true \
+               -C $QA_DIR/scopes/wp \
+               config get concretizer
+
+contains 'unify: false' \
+         spack -e $QA_DIR/scopes/true \
+               -C $QA_DIR/scopes/wp \
+               -C $QA_DIR/scopes/false \
+         config get concretizer
+
+contains 'unify: false' \
+         spack -C $QA_DIR/scopes/wp \
+               -C $QA_DIR/scopes/false \
+               -D $QA_DIR/scopes/true \
+         config get concretizer
+
+contains 'unify: when_possible' \
+         spack -C $QA_DIR/scopes/false \
+               -D $QA_DIR/scopes/true \
+               -C $QA_DIR/scopes/wp \
+               config get concretizer
+
+contains 'unify: false' \
+         spack -D $QA_DIR/scopes/true \
+               -C $QA_DIR/scopes/wp \
+               -C $QA_DIR/scopes/false \
+              config get concretizer
+
+contains 'SUCCESS' spack -C $QA_DIR/scopes/wp -e $QA_DIR/scopes/true python "$SHARE_DIR/qa/environment_activation.py"
+contains 'SUCCESS' spack -e $QA_DIR/scopes/true -C $QA_DIR/scopes/wp python "$SHARE_DIR/qa/environment_activation.py"
+contains 'SUCCESS' spack -C $QA_DIR/scopes/false -e $QA_DIR/scopes/true -C $QA_DIR/scopes/wp python "$SHARE_DIR/qa/environment_activation.py"
+contains 'SUCCESS' spack -C $QA_DIR/scopes/false -C $QA_DIR/scopes/wp -e $QA_DIR/scopes/true python "$SHARE_DIR/qa/environment_activation.py"
+contains 'SUCCESS' spack -C $QA_DIR/scopes/wp -C $QA_DIR/scopes/false -e $QA_DIR/scopes/true python "$SHARE_DIR/qa/environment_activation.py"
